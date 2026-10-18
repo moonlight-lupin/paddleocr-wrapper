@@ -1,0 +1,40 @@
+**SHIP**
+
+I'd ship this. All 13 items are fixed or bounded, and the gaps left are rare and self-limiting. One fix (item 2) works but falls short of what FIXES.md claims for it. I checked everything by reading the code only. My test harness against fake child processes was blocked by permissions, so none of the timings below were measured.
+
+## Item verdicts
+
+| # | Item | Verdict |
+|---|---|---|
+| 1 | `--device gpu`/`gpu:N` don't fall through to lower tiers | **RESOLVED**: `ensure_fields` raises the 500 at `paddle_service_candidate.py:435-437` unless `requested_device == "auto"`, and the `ft == "gpu"` branch has no tiers. `--device cpu` behaves as in the original. |
+| 2 | A hung child freezes the service | **PARTIALLY RESOLVED**: the freeze is now bounded, but longer than claimed (see A). |
+| 3 | Tier 3 replaces the GPU model / service stuck on CPU | **RESOLVED**: `tier3_fields` only writes `cpu_model`, a successful GPU call clears the fallback flags, and a CPU boot in auto mode tries tier 2 first. |
+| 4 | Empty paddle results raise IndexError | **RESOLVED**: `results_to_fields` is used on every paddle path. |
+| 5 | A line with missing confidence passes the gate | **RESOLVED** (`:366`). |
+| 6 | No request serialization | **RESOLVED**: `CHAIN_LOCK` is in place. The handlers are `async def`, so requests were already serialized on the event loop; the lock is harmless and only matters if they become `def`. |
+| 7 | Handshake needs READY as the first line | **RESOLVED (small gap)**: a blank stdout line before READY is still treated as a dead child (see C). |
+| 8 | Windows pipe encoding | **RESOLVED**: `ensure_ascii=True`, `PYTHONIOENCODING=utf-8`, and the parent reads as utf-8. |
+| 9 | One bad image kills a healthy child | **RESOLVED**: an `ok:false` reply no longer kills the child (but see D). |
+| 10 | Spawn-failure storm | **RESOLVED**: spawn failures and call failures both feed `failure_requests`; two in a row open the circuit. |
+| 11 | `/health` says ok with the worker missing | **RESOLVED** (`:452-454`). |
+| 12 | `/health` wrong around fallback | **RESOLVED**. |
+| 13 | Gate calibration and validation | **RESOLVED**: the calibration comment is there and the CLI rejects values outside (0, 1]. |
+
+## Remaining findings
+
+**A. Item 2: the stall can run to about 210 s, and it blocks the whole service (medium).**
+- **The retry restarts the clock.** A timeout in `RapidWorker.call` (`:315-330`) goes to the `except` block, which kills the child and moves to attempt 2. That respawns the child (up to 120 s handshake) and waits another full 100 s.
+- **Result for an image that always hangs:** about 100 + 3 + 100 s, plus about 8 s on tier 3, so around 210 s. The client times out at 120 s, so the comment at `:224` ("inside the VM client's 120 s urlopen budget") is wrong whenever attempt 2 is needed.
+- **The whole service stops answering meanwhile.** `_run_one` runs synchronously inside the `async def` handlers, so the wait sits on the event-loop thread. `/health`, `/logs` and the UI all stop responding for the stall. That contradicts the class docstring's "can never block the event loop" (`:218-220`).
+- **Why it's still shippable:** it needs a GPU failure and an onnxruntime hang at the same time. After two such requests the circuit opens and requests go straight to tier 3.
+- **Fix (about 2 lines):** don't retry after a timeout; keep the respawn retry only for a dead child or broken pipe. Optionally make `/ocr` and `/ocr/upload` plain `def` handlers so `CHAIN_LOCK` does real work and `/health` stays responsive.
+
+**B. Respawn race (low, unconfirmed).** `_pump` looks up `self.lines` each time it puts a line. After `_kill`, the old reader thread's end-of-stream `None` can land in the new queue that `_spawn` creates at `:275`. The new handshake then reads it as "died before READY". Two such spurious failures would open the circuit until restart. Fix: give `_pump` its own queue as an argument.
+
+**C. Blank line before READY (low).** At `:281`, `line.strip() == ""` raises "died before READY" for an ordinary blank noise line. Only `None` should mean the child died. Also, the 120 s timeout applies to each line, not to the whole handshake.
+
+**D. Image errors trip the permanent circuit (low).** `ok:false` replies add to `failure_requests` (`:354-359`). During a GPU outage, two images in a row that make RapidOCR throw will disable tier 2 until restart, even with a healthy child. Item 10 says "two failed calls" so this may be intended, but it undercuts item 9. Consider counting only transport failures toward the breaker.
+
+**E. Minor.** If `proc.wait(timeout=5)` times out in `_kill`, the outer `except` skips closing the pipes. This is unlikely on Windows, where kill is immediate.
+
+I didn't re-report anything on the accepted trade-offs list. I'd apply A's fix before rollout if possible (it's small); B–E can follow.

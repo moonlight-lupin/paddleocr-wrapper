@@ -1,0 +1,38 @@
+Writing the probe file was blocked, so this round is also code-reading only. Final verdict:
+
+---
+
+**SHIP**
+
+All 9 tracked items are fixed in the code: A–E from my last round and R2-1..R2-4. Two things to know first:
+
+- **FIXES.md has no R3 section.** It stops at R2. The R3 fixes exist only in commit `6dd234d` ("no retry on timeout, blank-line noise, transport-only breaker, threadpool handlers"), so I checked them against that diff. Add an R3 section so the record matches the code.
+- **I didn't run anything.** My probe with fake child processes was blocked (no permission to write the script), so every verdict below comes from reading the code.
+
+## Item verdicts
+
+| Item | Verdict | Evidence |
+|---|---|---|
+| **A**: 210 s stall that blocked the whole service | **FIXED** | A timeout now returns at once with no respawn (`paddle_service_candidate.py:349-351`). One 100 s budget covers spawn plus both attempts (`:317`). `/ocr` and `/ocr/upload` now run the chain in a threadpool (`:540`, `:555`), so `/health` and `/logs` keep answering. Worst case is about 100 s on tier 2 plus tier 3, but see residual 2. |
+| **B**: respawn race | **FIXED** | Each reader thread is tied to the queue created for its own child (`:281-283`, `:254-262`). |
+| **C**: blank line before READY | **FIXED** | Only a closed pipe (`None`) means the child died; blank lines are skipped (`:292-295`). One deadline covers the whole handshake. |
+| **D**: image errors tripped the breaker | **FIXED** | `rapid worker OCR failed` and `image encode failed` no longer count toward the breaker (`:380-385`). The prefixes match the strings at `:311` and `:343`. |
+| **E**: pipes not closed if `wait` timed out | **FIXED** | Pipes are closed in a `finally`, and `self.proc` is cleared first (`:234-252`). |
+| **R2-1**: one budget for the whole call | **FIXED** | The spawn timeout is capped at the remaining budget (`:325`). |
+| **R2-2**: handshake deadline | **FIXED** | One deadline for the whole handshake, no limit on the number of noise lines (`:284-298`). |
+| **R2-3**: old reader writing into a new queue | **FIXED** | Same change as B. |
+| **R2-4**: boot probe skipped in forced mode | **FIXED** | The probe now runs before the forced-rapidocr early return (`:832-843`). A failed probe sets the worker to None, so `/health` reports warming and requests get 503. |
+
+## Remaining issues (none block shipping)
+
+1. **Run the threadpool handlers live before rollout (medium, process).** Predict calls now run on anyio worker threads, while the GPU and CPU models are built on the main thread during startup (`:828`). The live checks in FIXES.md (GPU at 0.354 s, the concurrent CHAIN_LOCK test) appear to predate R3: FIXES.md was last committed at 14:41, before the R3 commit at 14:46. Running a Paddle predictor serially from another thread usually works, but it hasn't been tried on this host. Before the restart, do a 2-minute smoke test on port 8650 with `--force-tier auto`:
+   - one GPU request
+   - one request that falls through to tier 3 (the lazy CPU model loads on a worker thread)
+   - a `/health` call while a tier-3 request is running
+
+   This is the only condition on SHIP.
+2. **Tier-3 load time eats into the 120 s client timeout (low).** If tier 2 uses its full 100 s and tier 3 then has to load its CPU model for the first time, the request takes about 100 s, plus the load, plus about 8 s of predict. That can go past the client's 120 s. It needs a hang at the same moment as the first tier-3 use, and the breaker limits it to two such requests. Optional fix: lower `CALL_TIMEOUT_S` to about 80.
+3. **A child that crashes mid-call is no longer respawned within the request (low).** The read error at `:337` says "timed out or died", and the new check at `:349` matches "timed out", so a crash is now handled like a hang. That request goes to tier 3 without a respawn; the next request respawns the child. Two crashes in a row, for example an image that crashes onnxruntime, open the breaker until restart. Fix: use separate messages for a timeout (`""`) and a dead child (`None`), and keep the retry only for the dead child.
+4. **Rare `/health` race (cosmetic).** `/health` now runs in a thread, so `_kill` can set `w.proc = None` between the check and `w.proc.poll()` at `:505`. That gives one 500 on `/health`. Fix: read `w.proc` into a local first: `p = w and w.proc; bool(p and p.poll() is None)`.
+
+I left out the accepted trade-offs listed in FIXES.md.

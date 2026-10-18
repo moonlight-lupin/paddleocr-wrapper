@@ -1,0 +1,23 @@
+muse: workspace root: /root/.hermes/cache/scratch/rapidocr-trial/review (cwd default)
+muse: workspace trust: trusted source=run-flag
+muse: Skills: 47 loaded · 1 warning · 24 details hidden
+muse:   `skills_catalog` was trimmed to fit its size limit (32 KB): 10 descriptions compacted, 0 skill ids omitted
+muse:   Run `muse skills list --source all` for full diagnostics.
+SHIP
+
+All 9 scoped items verified RESOLVED with read-only probes (stubbed `paddle`/`cv2`/`fastapi`, real `RapidWorker`/`rapid_fields`/`startup` logic executed; both files also `py_compile` clean). Note: this workspace's [FIXES.md](/root/.hermes/cache/scratch/rapidocr-trial/review/FIXES.md) contains the R1 list and the R2 section but no R3 section — the R3 scope (findings A–E) is taken from [confirm_opus.log](/root/.hermes/cache/scratch/rapidocr-trial/review/confirm_opus.log), with fixes present in the working tree (commit `6dd234d`).
+
+| Item | Verdict | Probe evidence |
+|---|---|---|
+| R2-1 outer budget | RESOLVED | Hung call returns in-budget; `_spawn(timeout_s=min(SPAWN_TIMEOUT_S, remaining))`; babbling child bounded at 0.40 s vs 0.40 s budget |
+| R2-2 handshake deadline | RESOLVED | `MAX_NOISE_LINES` gone; 100 noise + READY accepted; endless noise deadlined in 0.06 s |
+| R2-3 stale pump | RESOLVED | `_pump(stream, out)` bound to one queue; stale pump wrote only to old queue (2 vs 0); `_spawn` passes explicit `(proc, q)` |
+| R2-4 forced-mode probe | RESOLVED | Probe precedes rapidocr early return in source; forced mode + failing probe → worker None, warm, no paddle init |
+| R3-A no retry on timeout | RESOLVED | Timeout → 1 spawn, immediate return; transport failure still gets its one respawn (2 spawns, success); both handlers use `run_in_threadpool` |
+| R3-B respawn race | RESOLVED | Same mechanism as R2-3, verified above |
+| R3-C blank-line noise | RESOLVED | `["\n", "   \n", "READY"]` accepted; `None` still means death |
+| R3-D transport-only breaker | RESOLVED | 2× `ok:false` and encode failures leave `failure_requests=0`, circuit closed; 2× transport failures open it; success resets streak |
+| R3-E `_kill` pipe close | RESOLVED | Pipes closed and `proc=None` even when `wait` raises |
+
+[rapid_worker.py](/root/.hermes/cache/scratch/rapidocr-trial/review/rapid_worker.py) unchanged since R1 and within scope: `ensure_ascii=True` present, per-request `except` keeps the child alive. No new defects found in the two files; accepted trade-offs not re-reported. Probes kept at [/tmp/probe_final.py](/tmp/probe_final.py) and [/tmp/probe_wallclock.py](/tmp/probe_wallclock.py), outside the repo.
+exit=0

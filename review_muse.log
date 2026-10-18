@@ -1,0 +1,33 @@
+muse: workspace root: /root/.hermes/cache/scratch/rapidocr-trial/review (cwd default)
+muse: workspace trust: trusted source=run-flag
+muse: Skills: 47 loaded · 1 warning · 24 details hidden
+muse:   `skills_catalog` was trimmed to fit its size limit (32 KB): 10 descriptions compacted, 0 skill ids omitted
+muse:   Run `muse skills list --source all` for full diagnostics.
+Verdict: REVISE
+
+Findings (all from read-only review plus read-only Python probes; no files modified):
+
+Must fix before rollout:
+
+- `--device gpu` / `gpu:N` runtime semantics changed. The original fell back to CPU only when `requested_device == "auto"` ([paddle_service_original.py](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_original.py:480)). The candidate's `ensure_fields` never consults `requested_device` (verified by AST probe), so a GPU runtime failure under `--device gpu` now descends to RapidOCR and paddle CPU. The candidate docstring still claims "force GPU, no fallback tiers" ([paddle_service_candidate.py](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:13)). This violates the brief constraint. Gate the except-path chain on `requested_device == "auto"`.
+- Shared-child protocol has no lock. Endpoints are `async def` sharing one `RapidWorker.proc`; two concurrent requests interleave stdin writes and stdout `readline`s, so request A can consume request B's `OCR {...}` line. Probe confirmed: no `Lock`, thread, or timeout primitive in either file. Add a lock (and note the handlers already block the event loop on sync predict, so serialize or move the chain to a threadpool).
+
+Should fix:
+
+- `_spawn` requires the very first stdout line to be `READY`, but the class docstring says other stdout lines are skipped as noise, and the per-request loop does skip them. Any pre-`READY` stdout noise (warnings, download progress) causes a spurious handshake failure and an unnecessary slow tier-3 run. Skip noise lines until `READY` with a bounded line count.
+- "Auto-recovery" comment is inaccurate and the behavior flaps. On the GPU-failure path a tier-2 success returns without touching `state["model"]`/`state["device"]`, so the next request retries the broken GPU instead of settling. Every request then pays GPU-fail plus ~2 s RapidOCR latency forever; only the tier-3 path flips permanently to CPU (verified: `tier3_fields` sets both). Decide: keep the original one-shot permanent fallback, or retry deliberately with a backoff and cap.
+- No per-call timeout anywhere (confirmed by probe), including the `_spawn` handshake `readline`. A hung child blocks the request, and since the async handlers call blocking code directly, it stalls all requests until the VM's 120 s client timeout. The original's worst case was bounded (~9 s). Minimum: timeout the read, kill the child, degrade to tier 3. Best: run the chain in a threadpool with a timeout.
+- `kill()` without `wait()` or pipe close in the retry path and `stop()` leaks zombies and fds across respawns. The unreachable `return None` after the `while True` in `call` is dead code; harmless but worth deleting.
+
+Minor / judgment calls from the brief:
+
+- Gate default 0.70 with GST at 0.7159 (0.016 margin): acceptable as-is because the failure direction is safe (a dip triggers a slower but exact tier-3 re-run). Add a code comment recording the 0.7159 observation. Also validate `--conf-gate` range: `>1` forces tier 3 always, `<=0` silently disables the safety gate.
+- `/health` reports `ok` under `--force-tier rapidocr` even when the worker is missing, while `/ocr` then 503s. Make health reflect worker presence.
+- `rapid.failures` counts per attempt (up to 2 per request) so it can exceed `uses`. Fine if documented for the health consumer.
+- 500 error string changed from `"paddle predict failed"` to `"predict failed"`. Confirm the VM client does not match on it.
+
+Verified good (no action):
+
+- Normal-boot startup prewarm path is byte-identical apart from the new `force_tier` guards. `--device cpu` path is unchanged (direct paddle CPU). Response keys `{text, lines, elapsed_s, device}` are unchanged; tier-2 line dicts match the `{index, text, confidence, box}` shape. Zero-lines gating and spawn/protocol/dead-child degradation to tier 3 work as briefed (timeout excepted). The separate-venv isolation keeps the GPU venv untouched.
+
+muse exited 0
