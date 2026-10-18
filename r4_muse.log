@@ -1,0 +1,22 @@
+muse: workspace root: /root/.hermes/cache/scratch/rapidocr-trial/review (cwd default)
+muse: workspace trust: trusted source=run-flag
+muse: Skills: 47 loaded · 1 warning · 24 details hidden
+muse:   `skills_catalog` was trimmed to fit its size limit (32 KB): 10 descriptions compacted, 0 skill ids omitted
+muse:   Run `muse skills list --source all` for full diagnostics.
+SHIP
+
+All three R4 items verified against the 61-line [r4.diff](/root/.hermes/cache/scratch/rapidocr-trial/review/r4.diff) and the affected code in [paddle_service_candidate.py](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py). Scope held: the diff touches only the timeout constant, the `call()` sentinel/except branch, and the `/health` local. No other files or hunks.
+
+- R4-1 (80 s budget): `CALL_TIMEOUT_S` is 80, `SPAWN_TIMEOUT_S` unchanged at 120. Budget math holds: 80 + ~11.2 s cold tier-3 ≈ 91.2 < 120 s client budget.
+- R4-2 (distinct sentinels): `_read` returns `""` on `queue.Empty` and `None` on pump EOF; `call()` maps `None` to `DEAD-CHILD` (respawn retry) and `""` to `TIMED-OUT` (immediate return, no respawn). Old conflated `if not line` and lowercase `"timed out"/"budget"` except are gone; budget exhaustion now raises the `TIMED-OUT` class.
+- R4-3 (`/health` race): `p = w and w.proc` captured once, `spawned` uses only the local `p`. No `w.proc.poll()` remains.
+
+Observed probe output (read-only, probes in `/tmp`, repo left untouched):
+
+- `_read: timeout->'' (0.050s) vs EOF->None DISTINCT PASS`
+- `DEAD-CHILD: respawn+retry within budget PASS`
+- `TIMED-OUT: no-respawn immediate return PASS (0.000s)`
+- `R4-3: old double-deref crashes under race, new local-capture survives PASS`
+- `py_compile clean` (pyc artifact restored afterward; `git status` shows no modifications from this review).
+
+exit=0

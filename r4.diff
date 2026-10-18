@@ -1,0 +1,61 @@
+diff --git a/paddle_service_candidate.py b/paddle_service_candidate.py
+index fd24a4a..8c56fbd 100644
+--- a/paddle_service_candidate.py
++++ b/paddle_service_candidate.py
+@@ -221,7 +221,9 @@ class RapidWorker:
+     """
+ 
+     SPAWN_TIMEOUT_S = 120   # model load + READY handshake (budget-capped per call)
+-    CALL_TIMEOUT_S = 100    # whole tier-2 attempt budget: spawn + retries, all inside
++    CALL_TIMEOUT_S = 80     # whole tier-2 attempt budget, sized so the tier-2
++                            # timeout plus a cold tier-3 load still fits the
++                            # VM client's 120 s urlopen budget
+ 
+     def __init__(self, python_exe: str, script_path: str):
+         self.python_exe = python_exe
+@@ -331,10 +333,12 @@ class RapidWorker:
+                 while True:
+                     remaining = outer - time.time()
+                     if remaining <= 0:
+-                        raise RuntimeError(f"tier2 call budget exhausted ({self.CALL_TIMEOUT_S}s)")
++                        raise RuntimeError(f"TIMED-OUT: tier2 call budget exhausted ({self.CALL_TIMEOUT_S}s)")
+                     line = self._read(remaining)
+-                    if not line:  # queue timeout or child death
+-                        raise RuntimeError("rapid worker timed out or died")
++                    if line is None:  # closed pipe: dead child (respawn retry allowed)
++                        raise RuntimeError("DEAD-CHILD: rapid worker died mid-call")
++                    if line == "":  # read timed out within budget: hang (no respawn - opus R3 A)
++                        raise RuntimeError(f"TIMED-OUT: rapid worker read timed out")
+                     if line.startswith("OCR "):
+                         resp = json.loads(line[4:])
+                         if resp.get("ok"):
+@@ -346,9 +350,10 @@ class RapidWorker:
+                 state["rapid"]["failures"] += 1  # counts attempts, may exceed uses
+                 log(f"rapidocr tier attempt {attempt} failed: {exc}")
+                 self._kill()
+-                if "timed out" in str(exc) or "budget" in str(exc):
+-                    # a hang: do not respawn and wait again (opus R3 finding A)
++                if "TIMED-OUT" in str(exc):
++                    # a hang or spent budget: do not respawn and wait again (opus R3 A)
+                     return None, f"tier2 call failed: {exc}"
++                # dead child: allow the one respawn within the remaining budget
+         return None, "tier2 call failed"
+ 
+     def probe(self) -> str | None:
+@@ -475,6 +480,7 @@ def ensure_fields(img: np.ndarray) -> tuple[dict, str]:
+ @app.get("/health")
+ def health():
+     w = state["rapid_worker"]
++    p = w and w.proc  # local: _kill can null w.proc between check and poll (opus R3 fix 4)
+     ready = state["model"] is not None or (
+         state["force_tier"] == "rapidocr" and w is not None
+     )
+@@ -502,7 +508,7 @@ def health():
+             "enabled": w is not None,
+             "python": state["rapid_worker_py"],
+             "script": state["rapid_worker_script"],
+-            "spawned": bool(w and w.proc is not None and w.proc.poll() is None),
++            "spawned": bool(p is not None and p.poll() is None),
+             **state["rapid"],
+         },
+         "gpu_runtime_failures": state["gpu_runtime_failures"],

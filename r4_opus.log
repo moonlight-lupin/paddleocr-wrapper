@@ -1,0 +1,24 @@
+SHIP
+
+I checked R4-1, R4-2 and R4-3 against my residuals 2, 3 and 4. All three fixes are correct and complete, and none of them introduces a new problem. I only read the code; I did not re-run the probes or the live smoke test.
+
+**R4-1 (residual 2: tier-3 load eats into the 120 s client timeout): correct.**
+- `CALL_TIMEOUT_S = 80` (`paddle_service_candidate.py:224`) is the one deadline for the whole tier-2 call. The spawn timeout is capped to whatever remains of it (`:327`).
+- Worst case for one request: 80 s tier-2 budget, plus up to 5 s for `_kill`'s `wait(5)`, plus about 0.5 s for the tier-1 GPU attempt, plus about 11 s for a cold tier-3 load and predict (measured at 10.8–11.2 s). That is about 97 s, which leaves roughly 23 s inside the client's 120 s.
+- Requests queued behind `CHAIN_LOCK` can still go over, but that was true before this change and is not part of this delta.
+
+**R4-2 (residual 3: a crashed child was treated like a hang): correct.**
+- The two cases are now told apart reliably. A real line from the child can never be `""`, because lines read from a pipe always end in `\n`. So `""` can only mean the read timed out, and `None` is only sent when the reader thread hits a closed pipe.
+- `None` raises `DEAD-CHILD`, which doesn't contain `TIMED-OUT`. The request then kills the child and respawns it once within the remaining budget.
+- `""` and a spent budget both raise `TIMED-OUT`, so the request returns at once with no respawn. The fix for the 210 s stall (my R3 finding A) is unchanged.
+- A timeout during the startup handshake raises messages without the `TIMED-OUT` tag, so it falls through to attempt 2. That is still bounded: the handshake was given the whole remaining budget, so attempt 2 finds nothing left (`remaining <= 0`) and returns straight away. A child that dies before `READY` gets the one respawn, as it did before.
+- A malformed `OCR` line (`json.loads` fails) also gets the respawn path. That is reasonable for a corrupted protocol.
+- Breaker behaviour is as intended. A request that fails both attempts counts once, so two images in a row that crash the child still open the breaker. That matches what residual 3 described.
+
+**R4-3 (residual 4: rare `/health` race): correct and complete.**
+- `p = w and w.proc` (`:483`) gives `None` whether the worker is missing or its child is unset. Calling `poll()` on a `Popen` that has been killed and had its pipes closed is safe.
+- No other code outside the class reads `w.proc` (I grepped), so this was the only place the race could happen.
+
+**Nits (none affect the verdict):**
+- `f"TIMED-OUT: rapid worker read timed out"` at `:340` is an f-string with no placeholders. It only matters to a linter.
+- The two documents number the fixes differently. In `R4_CONFIRM.md`, R4-1/2/3 are the timeout, the separate dead-child/timeout handling, and `/health`. In `FIXES.md:105-109`, R4-1 is the dead-child fix (my residual 3) and R4-2 is `/health` (residual 4), while the timeout change sits under R3-A. Align the two if these documents are kept.

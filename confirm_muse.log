@@ -1,0 +1,27 @@
+muse: workspace root: /root/.hermes/cache/scratch/rapidocr-trial/review (cwd default)
+muse: workspace trust: trusted source=run-flag
+muse: Skills: 47 loaded · 1 warning · 24 details hidden
+muse:   `skills_catalog` was trimmed to fit its size limit (32 KB): 10 descriptions compacted, 0 skill ids omitted
+muse:   Run `muse skills list --source all` for full diagnostics.
+SHIP
+
+All 13 numbered items verified RESOLVED with read-only probes against [candidate](</root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py>) and [worker](</root/.hermes/cache/scratch/rapidocr-trial/review/rapid_worker.py>) (stubbed `paddle`/`cv2`/`fastapi`, real logic executed; context from BRIEF.md, tier2.diff, original).
+
+| # | Verdict | Probe evidence |
+|---|---------|----------------|
+| 1 | RESOLVED | Explicit `gpu` and `gpu:1` with raising model both raise HTTP 500 `{"error": "paddle predict failed"}`; `ft == "gpu"` branch returns directly with no tier descent; except-path re-raises unless `requested_device == "auto"`. |
+| 2 | RESOLVED | `SPAWN_TIMEOUT_S=120`, `CALL_TIMEOUT_S=100`, reader-thread + `queue.Queue`, daemon writer thread, deadline loop with `_read(remaining)`, `_kill` = `kill` + `wait(5)` + stdin/stdout close; empty-queue `_read(0.2)` returned `""` in 0.20 s. |
+| 3 | RESOLVED | `tier3_fields` leaves `state["model"]`/`state["device"]` identical (own `cpu_model` slot); auto GPU failure descends with `fallback_active=True`, next GPU success clears flags + logs "GPU recovered"; boot `cpu`+`auto` serves tier 2 first (`rapidocr-cpu`, `uses=1`), gated tier-2 falls to `cpu`, `--device cpu` never calls tier 2. Initial NOT-RESOLVED was my probe's fault (zero-line stub correctly gates). |
+| 4 | RESOLVED | `results_to_fields([])` and `(None)` both return `{"lines": [], "text": ""}`, no `IndexError`. |
+| 5 | RESOLVED | Line with `confidence: None` returns `(None, "tier2 conf gate (missing confidence on a line)")`, `gated=1`. |
+| 6 | RESOLVED | `CHAIN_LOCK` is a `threading.Lock`; `_run_one` wraps `ensure_fields` in `with CHAIN_LOCK`. |
+| 7 | RESOLVED | `MAX_NOISE_LINES = 100`, handshake loops `range(MAX_NOISE_LINES)` until a stripped line `== "READY"`. |
+| 8 | RESOLVED | Worker uses `ensure_ascii=True`; parent sets `PYTHONIOENCODING=utf-8` and `encoding="utf-8"`. |
+| 9 | RESOLVED | `{ok:false}` returns `(None, reason)` with zero kills (functional probe: `killed==[]`); `_kill` only on the stale-proc and exception paths; `for attempt in (1, 2)` = one respawn/request. |
+| 10 | RESOLVED | Two consecutive `rapid_fields` failures set `circuit_open=True` with restart-only-reset log; attempt counter `state["rapid"]["failures"] += 1` sits in `call()`'s except path so spawn failures count. |
+| 11 | RESOLVED | Forced `rapidocr` + worker missing → `/health` `warming`; worker present → `ok`. |
+| 12 | RESOLVED | GPU success clears `fallback_active`/`fallback_reason`; tier-2-serve and tier-3 paths set them; `/health` exposes `rapid.{uses,failures,gated,failure_requests,circuit_open}` + `gpu_runtime_failures`. |
+| 13 | RESOLVED | Calibration comment (`0.61-0.64` vs `0.7159`) present above `rapid_fields`; CLI rejects `--conf-gate` outside `(0, 1]`; default `0.70`. |
+
+No new defects found in the two files within this scope.
+muse exit=0

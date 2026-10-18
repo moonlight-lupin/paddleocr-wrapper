@@ -1,0 +1,2990 @@
+Reading additional input from stdin...
+OpenAI Codex v0.163.0
+--------
+workdir: /root/.hermes/cache/scratch/rapidocr-trial/review
+model: gpt-6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 01a14d92-7547-73d0-b7d3-f40c8d09940a
+--------
+user
+Read BRIEF.md in this directory, then review paddle_service_candidate.py against paddle_service_original.py (also read tier2.diff and rapid_worker.py). Read-only: do not modify files. Probe for introduced defects per the brief. End with a verdict line: APPROVE / APPROVE WITH FIXES / REVISE, followed by findings.
+codex
+I’ll read the brief and the four code artifacts, then trace the changed paths for defects introduced by the candidate. I’ll keep the workspace read-only.
+exec
+/bin/bash -lc "pwd && rg --files -g 'BRIEF.md' -g 'paddle_service_candidate.py' -g 'paddle_service_original.py' -g 'tier2.diff' -g 'rapid_worker.py' -g 'AGENTS.md'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+/root/.hermes/cache/scratch/rapidocr-trial/review
+rapid_worker.py
+paddle_service_candidate.py
+BRIEF.md
+tier2.diff
+paddle_service_original.py
+
+exec
+/bin/bash -lc 'wc -l BRIEF.md paddle_service_candidate.py paddle_service_original.py tier2.diff rapid_worker.py && cat BRIEF.md && cat tier2.diff' in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+   65 BRIEF.md
+  788 paddle_service_candidate.py
+  570 paddle_service_original.py
+  399 tier2.diff
+   56 rapid_worker.py
+ 1878 total
+# Review Brief: tier-2 RapidOCR CPU fallback for paddle-ocr-service
+
+You are a read-only reviewer. Do not modify any file. Read the brief, the diff,
+both service versions, and the new worker file. Probe for introduced defects.
+End with a verdict line: APPROVE / APPROVE WITH FIXES / REVISE, plus findings.
+
+## What changed and why
+
+The OCR service on the Windows PC (<PC-LAN>:8649) currently degrades as:
+paddle GPU -> in-place paddle CPU (mkldnn off, measured 6.8-9.5 s/img).
+Measured 2026-10-18 on the same PC: RapidOCR 3.10.0 (onnxruntime 1.31.0,
+PP-OCRv6 medium ONNX) answers warm in 1.5-2.2 s/img with exact text on all ZH
+and receipt variants, but corrupts one digit-bearing lowercase EN line type
+(observed conf 0.61-0.64 while correct EN prose lines score >= 0.99 on the
+same engine), with instability across near-identical renders.
+
+This change inserts RapidOCR as tier 2 between GPU and paddle CPU, with a
+low-confidence gate: any tier-2 line below the gate (default 0.70) re-runs the
+whole image on paddle CPU (tier 3) before the response.
+
+Files:
+- tier2.diff                 unified diff, original vs candidate
+- paddle_service_original.py current live version (ground truth for review)
+- paddle_service_candidate.py proposed replacement
+- rapid_worker.py            NEW file, tier-2 child process
+
+## Architecture decision
+
+RapidOCR runs in a separate venv as a persistent child process with a
+line-JSON protocol (READY, then "OCR {json}" per request). This deliberately
+avoids installing onnxruntime/rapidocr/opencv-headless into the live GPU venv
+(opencv-contrib-python already owns cv2 there; a second opencv package
+collides), and keeps the GPU venv byte-identical to production.
+
+## Verified by live test (2026-10-18, port 8650, service root untouched)
+
+1. --force-tier rapidocr + worker: clean EN fixture -> device rapidocr-cpu,
+   2.6 s, 4 lines exact, boxes populated. (Tier-2 pass path.)
+2. gen_hard noisy EN render (known tier-2 conf 0.607) -> gated, re-run on
+   paddle CPU tier 3, device cpu, 4 lines exact. (Gate path.)
+3. tier 3 lazily initialized on first gated/failed request; /health reflects
+   uses/failures/gated counts and fallback_reason.
+4. zh lowres fixture -> tier-2 pass (ZH is rapidocr-strong).
+5. Live service root file was temporarily overwritten by mistake during
+   rollout prep and was restored from a verified reconstruction before any
+   restart could load it; the running production process was never affected.
+
+## Constraints
+
+- Production response shape must not change: {text, lines:[{index,text,
+  confidence, box}], elapsed_s, device}. device gains labels rapidocr-cpu / cpu.
+- --device cpu and --device gpu semantics must be unchanged from the original.
+- No new dependencies in the GPU venv. The tier-2 child must degrade to tier 3
+  on spawn failure, protocol failure, or a timed-out/dead child.
+- Startup prewarm/probe behavior for the normal (non-forced) boot must remain.
+
+## Known deltas I want your judgment on
+
+- GPU per-request retry on runtime failure (auto-recovery) vs the original
+  one-shot permanent CPU fallback. Intentional; check no pathological loop.
+- tier-2 zero-lines result is gated (treated as min_conf 0.0). Intentional.
+- receipt "GST 9%" scores 0.7159 on tier 2, only 0.016 above the default gate.
+  Consider whether the default 0.70 needs a comment or different default.
+- The worker has no per-call timeout: a hung child blocks the request until
+  the HTTP client times out. Assess severity given the client (VM) uses a
+  120 s urlopen timeout.--- paddle_service_original.py	2026-10-18 13:35:05.191359479 +0800
++++ paddle_service_candidate.py	2026-10-18 13:45:31.077343374 +0800
+@@ -1,13 +1,23 @@
+ """PaddleOCR service — FastAPI wrapper for the Windows PC.
+ 
+-Runs the paddleocr 3.x defaults (PP-OCRv6 det+rec). One script, one port:
+-GPU build -> serves fast OCR with automatic CPU fallback.
++Engine chain (all PP-OCRv6_medium det+rec):
++  1. paddle GPU  (paddlepaddle-gpu, ~0.05-0.34s/img)
++  2. RapidOCR cpu (onnxruntime, separate venv child process, ~1.5-2.2s/img;
++     lazy-spawned only after a GPU runtime failure)
++  3. paddle CPU  (mkldnn off, ~7-9.5s/img; also re-runs when tier 2 output
++     has any line below the tier-2 confidence gate)
+ 
+ Devices:
+-  --device auto  GPU first (build + driver + real prewarm predict), CPU fallback
+-  --device cpu   force CPU
+-  --device gpu   force GPU (gpu:0)
++  --device auto  GPU first (build + driver + real prewarm predict)
++  --device cpu   force paddle CPU (chain disabled)
++  --device gpu   force GPU, no fallback tiers
+   --device gpu:N pin a specific CUDA device
++Tier flags:
++  --no-rapid            disable tier 2 (GPU -> paddle CPU only)
++  --rapid-worker PATH   python.exe of the RapidOCR venv (tier 2)
++  --rapid-worker-script PATH  rapid_worker.py (tier 2 child protocol)
++  --conf-gate F         tier-2 min line confidence; below -> tier 3 re-run (default 0.70)
++  --force-tier T        test/ops override: auto|gpu|paddle-cpu|rapidocr
+ Models:
+   --det-model/--rec-model override packaged defaults (auto-downloaded; e.g. a newer release)
+ GUI:
+@@ -19,7 +29,10 @@
+ import base64
+ import binascii
+ import datetime as dt
++import json
+ import logging
++import os
++import subprocess
+ import time
+ from collections import deque
+ 
+@@ -47,6 +60,14 @@
+     "first_error": None,
+     "warm": False,
+     "error": None,
++    # engine chain (tier 2 = RapidOCR child process)
++    "force_tier": "auto",
++    "conf_gate": 0.70,
++    "rapid_worker": None,
++    "rapid_worker_py": None,
++    "rapid_worker_script": None,
++    "rapid": {"uses": 0, "failures": 0, "gated": 0},
++    "gpu_runtime_failures": 0,
+ }
+ 
+ # --- ring log -------------------------------------------------------------
+@@ -142,26 +163,176 @@
+         raise HTTPException(status_code=400, detail=f"cannot decode image (filename={filename!r})")
+     t0 = time.time()
+     try:
+-        results = ensure_predict(img)
++        fields, device_label = ensure_fields(img)
+     except HTTPException:
+         raise
+     except Exception as exc:
+-        raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)})
++        raise HTTPException(status_code=500, detail={"error": "predict failed", "detail": str(exc)})
+     elapsed = time.time() - t0
+-    fields = result_fields(results[0]) if results else {"lines": [], "text": ""}
+-    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={state['device']}", console=False)
++    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={device_label}", console=False)
+     return {
+         "text": fields["text"],
+         "lines": fields["lines"],
+         "elapsed_s": round(elapsed, 3),
+-        "device": state["device"],
++        "device": device_label,
+     }
+ 
+ 
++# --- tier 2: RapidOCR child process ----------------------------------------
++
++
++class RapidWorker:
++    """Persistent rapid_worker.py child process, line-JSON protocol.
++
++    Child prints 'READY' once its engine is loaded, then one 'OCR {json}' line
++    per request. Any other stdout line is skipped as child-side noise.
++    """
++
++    def __init__(self, python_exe: str, script_path: str):
++        self.python_exe = python_exe
++        self.script_path = script_path
++        self.proc = None
++
++    def _spawn(self):
++        self.proc = subprocess.Popen(
++            [self.python_exe, self.script_path],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            text=True,
++            encoding="utf-8",
++            cwd=os.path.dirname(os.path.abspath(self.script_path)) or None,
++        )
++        line = self.proc.stdout.readline()
++        if line.strip() != "READY":
++            raise RuntimeError(f"rapid worker handshake failed: {line[:200]!r}")
++        log("rapidocr tier spawned")
++
++    def call(self, img: np.ndarray) -> dict | None:
++        """Run OCR on a decoded BGR array. Returns fields dict or None on failure."""
++        ok, buf = cv2.imencode(".png", img)
++        if not ok:
++            return None
++        payload = json.dumps({"image": base64.b64encode(buf.tobytes()).decode("ascii")})
++        for attempt in (1, 2):  # one respawn allowed within a single request
++            try:
++                if self.proc is None or self.proc.poll() is not None:
++                    self.proc = None
++                    self._spawn()
++                self.proc.stdin.write(payload + "\n")
++                self.proc.stdin.flush()
++                while True:
++                    line = self.proc.stdout.readline()
++                    if not line:  # child died
++                        raise RuntimeError("rapid worker stdout closed")
++                    if line.startswith("OCR "):
++                        resp = json.loads(line[4:])
++                        if resp.get("ok"):
++                            return {"lines": resp["lines"], "text": resp["text"]}
++                        raise RuntimeError(f"rapid worker error: {resp.get('error')}")
++                    # skip noise lines
++                return None
++            except Exception as exc:
++                state["rapid"]["failures"] += 1
++                log(f"rapidocr tier attempt {attempt} failed: {exc}")
++                try:
++                    if self.proc is not None:
++                        self.proc.kill()
++                except Exception:
++                    pass
++                self.proc = None
++        return None
++
++    def stop(self):
++        try:
++            if self.proc is not None:
++                self.proc.kill()
++        except Exception:
++            pass
++        self.proc = None
++
++
++def rapid_fields(img: np.ndarray) -> tuple[dict | None, str]:
++    """Tier 2 attempt. Returns (fields, 'rapidocr-cpu') or (None, reason)."""
++    w = state["rapid_worker"]
++    if w is None:
++        return None, "tier2 disabled"
++    state["rapid"]["uses"] += 1
++    fields = w.call(img)
++    if fields is None:
++        return None, "tier2 call failed"
++    confs = [ln["confidence"] for ln in fields["lines"] if ln.get("confidence") is not None]
++    min_conf = min(confs) if confs else 0.0
++    if min_conf < state["conf_gate"]:
++        state["rapid"]["gated"] += 1
++        log(f"tier2 min_conf {min_conf:.3f} < gate {state['conf_gate']}; re-running on paddle CPU")
++        return None, f"tier2 conf gate (min_conf {min_conf:.3f})"
++    return fields, "rapidocr-cpu"
++
++
++def tier3_fields(img: np.ndarray, reason: str) -> tuple[dict, str]:
++    """Tier 3: paddle CPU (existing standby path, lazily initialized)."""
++    if state["device"] == "cpu" and state["model"] is not None:
++        res = state["model"].predict(img)
++        return result_fields(res[0]), "cpu"
++    if state["model"] is None or state["device"] != "cpu":
++        log(f"initializing paddle CPU tier 3 ({reason})")
++        model = init_model("cpu")
++        if not warm_predict(model):
++            raise HTTPException(status_code=500, detail={"error": "predict failed: paddle CPU fallback prewarm failed"})
++        state["model"] = model
++        state["device"] = "cpu"
++        state["fallback_active"] = True
++        state["fallback_reason"] = reason
++    state["fallback_active"] = True
++    if not state["fallback_reason"]:
++        state["fallback_reason"] = reason
++    res = state["model"].predict(img)
++    return result_fields(res[0]), "cpu"
++
++
++def ensure_fields(img: np.ndarray) -> tuple[dict, str]:
++    """Engine chain. Returns (fields, device_label). Raises HTTPException only if everything fails."""
++    ft = state["force_tier"]
++    if ft == "rapidocr":
++        fields, why = rapid_fields(img)
++        if fields is not None:
++            return fields, why
++        return tier3_fields(img, f"tier2 unavailable ({why})")
++    if ft == "paddle-cpu":
++        return tier3_fields(img, "forced paddle-cpu")
++    if ft == "gpu":
++        if state["model"] is None:
++            raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
++        res = state["model"].predict(img)
++        return result_fields(res[0]), state["device"]
++    if state["model"] is None:
++        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
++    if state["device"] == "cpu":
++        # booted on CPU by request: chain ends here (paddle CPU is the last tier)
++        res = state["model"].predict(img)
++        return result_fields(res[0]), "cpu"
++    # tier 1: paddle GPU. Per-request retry keeps auto-recovery: a transient
++    # VRAM conflict repairs itself on the next request without a restart.
++    try:
++        res = state["model"].predict(img)
++        return result_fields(res[0]), state["device"]
++    except Exception as exc:
++        state["gpu_runtime_failures"] += 1
++        reason = f"GPU runtime failure ({state['gpu_runtime_failures']}): {exc}"
++        state["fallback_reason"] = reason
++        log(f"{reason}; descending engine chain")
++        fields, why = rapid_fields(img)
++        if fields is not None:
++            return fields, "rapidocr-cpu"
++        return tier3_fields(img, f"tier 2 unavailable ({why}); {reason}")
++
++
+ @app.get("/health")
+ def health():
++    ready = state["model"] is not None or state["force_tier"] == "rapidocr"
++    w = state["rapid_worker"]
+     return {
+-        "status": "ok" if state["model"] is not None else "warming",
++        "status": "ok" if ready else "warming",
+         "service": "paddle-ocr-service",
+         "device": state["device"],
+         "device_requested": state["requested_device"],
+@@ -177,12 +348,45 @@
+         "paddle_version": paddle.__version__,
+         "paddleocr_version": paddleocr.__version__,
+         "paddle_compiled_with_cuda": paddle.device.is_compiled_with_cuda(),
++        "force_tier": state["force_tier"],
++        "engine_chain": engine_chain(),
++        "conf_gate": state["conf_gate"],
++        "rapid_worker": {
++            "enabled": w is not None,
++            "python": state["rapid_worker_py"],
++            "script": state["rapid_worker_script"],
++            "spawned": bool(w and w.proc is not None and w.proc.poll() is None),
++            **state["rapid"],
++        },
++        "gpu_runtime_failures": state["gpu_runtime_failures"],
+     }
+ 
+ 
++def engine_chain() -> list[str]:
++    if state["force_tier"] == "rapidocr":
++        tiers = ["rapidocr-cpu", "paddle-cpu"]
++    elif state["force_tier"] == "paddle-cpu":
++        tiers = ["paddle-cpu"]
++    elif state["force_tier"] == "gpu":
++        tiers = ["paddle-gpu"]
++    elif state["rapid_worker"] is not None:
++        tiers = ["paddle-gpu", "rapidocr-cpu", "paddle-cpu"]
++    else:
++        tiers = ["paddle-gpu", "paddle-cpu"]
++    return tiers
++
++
++def check_ready():
++    if state["force_tier"] == "rapidocr":
++        if state["rapid_worker"] is None:
++            raise HTTPException(status_code=503, detail={"error": "rapidocr tier not configured (worker missing)"})
++        return
++    get_model()
++
++
+ @app.post("/ocr")
+ async def ocr_json(body: OcrJson):
+-    get_model()
++    check_ready()
+     img_bytes = decode_image_bytes(body.image_b64, body.mime)
+     return _run_one(img_bytes, None)
+ 
+@@ -197,10 +401,11 @@
+ 
+ @app.post("/ocr/upload")
+ async def ocr_upload(image: UploadFile = File(...)):
+-    get_model()
++    check_ready()
+     raw = await image.read()
+     return _run_one(raw, image.filename)
+ 
++
+ # --- GUI + logs -----------------------------------------------------------
+ UI_HTML = """<!doctype html>
+ <html lang="en"><head><meta charset="utf-8">
+@@ -470,37 +675,17 @@
+     return PaddleOCR(**kwargs)
+ 
+ 
+-def ensure_predict(img):
+-    """Predict, falling back to CPU once if a GPU run dies (init-time or runtime)."""
+-    if state["model"] is None:
+-        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+-    try:
+-        return state["model"].predict(img)
+-    except Exception as exc:
+-        gpu_broken = state["device"] != "cpu" and state["requested_device"] == "auto"
+-        if not gpu_broken:
+-            raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)}) from exc
+-        log(f"GPU predict failed ({exc}); falling back to CPU")
+-        try:
+-            model = init_model("cpu")
+-            if not warm_predict(model):
+-                raise RuntimeError("CPU prewarm failed too")
+-            state["model"] = model
+-            state["device"] = "cpu"
+-            state["fallback_active"] = True
+-            state["fallback_reason"] = f"GPU runtime failure: {exc}"
+-            return model.predict(img)
+-        except Exception as exc2:
+-            raise HTTPException(
+-                status_code=500,
+-                detail={"error": "predict failed on GPU and CPU fallback", "detail": str(exc2)},
+-            ) from exc2
+-
+-
+ @app.on_event("startup")
+ def startup():
++    if state["force_tier"] == "rapidocr":
++        # test/ops mode: no paddle init at all; tier 2 spawns lazily on first request
++        log("skipping paddle init: --force-tier rapidocr (tier 2 only)")
++        state["warm"] = True
++        return
+     req = state["requested_device"]
+-    if req == "auto":
++    if state["force_tier"] == "paddle-cpu":
++        candidates = ["cpu"]
++    elif req == "auto":
+         candidates = ["cpu"]
+         if paddle.device.is_compiled_with_cuda():
+             try:
+@@ -539,6 +724,9 @@
+ 
+ @app.on_event("shutdown")
+ def shutdown():
++    w = state["rapid_worker"]
++    if w is not None:
++        w.stop()
+     log("service stopped")
+ 
+ 
+@@ -559,12 +747,42 @@
+                         help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+                              "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+                              "not support' inside predict.")
++    parser.add_argument("--no-rapid", action="store_true",
++                        help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
++    parser.add_argument("--rapid-worker", default=None,
++                        help="python.exe of the RapidOCR venv for tier 2. "
++                             "Default: <service dir>\\.venv-rapid\\Scripts\\python.exe. "
++                             "If the path does not exist, tier 2 is disabled with a /health note.")
++    parser.add_argument("--rapid-worker-script", default=None,
++                        help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
++    parser.add_argument("--conf-gate", type=float, default=0.70,
++                        help="tier-2 min line confidence; any line below triggers a tier-3 "
++                             "paddle CPU re-run. Default 0.70.")
++    parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
++                        help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
+     args = parser.parse_args()
+     state["requested_device"] = args.device
+     state["lang"] = args.lang
+     state["det_model"] = args.det_model
+     state["rec_model"] = args.rec_model
+     state["enable_mkldnn"] = bool(args.mkldnn)
++    state["force_tier"] = args.force_tier
++    state["conf_gate"] = args.conf_gate
++
++    service_dir = os.path.dirname(os.path.abspath(__file__))
++    rapid_py = args.rapid_worker or os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
++    rapid_script = args.rapid_worker_script or os.path.join(service_dir, "rapid_worker.py")
++    state["rapid_worker_py"] = rapid_py
++    state["rapid_worker_script"] = rapid_script
++    if args.no_rapid:
++        log("tier 2 disabled by --no-rapid")
++    elif not os.path.exists(rapid_py):
++        log(f"tier 2 disabled: rapid worker python not found at {rapid_py}")
++    elif not os.path.exists(rapid_script):
++        log(f"tier 2 disabled: rapid worker script not found at {rapid_script}")
++    else:
++        state["rapid_worker"] = RapidWorker(rapid_py, rapid_script)
++        log(f"tier 2 enabled: {rapid_py} conf_gate={args.conf_gate}")
+ 
+     import uvicorn
+ 
+
+exec
+/bin/bash -lc "nl -ba paddle_service_original.py | sed -n '230,570p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+   230	transition:border-color .5s cubic-bezier(.25,.46,.45,.94),background .5s cubic-bezier(.25,.46,.45,.94)}
+   231	.drop:hover,.drop.on{border-color:var(--accent);background:var(--accent-soft);color:var(--ink)}
+   232	.btn{display:inline-block;padding:6px 14px;border:1px solid var(--ink);
+   233	border-radius:8px;background:var(--ink);color:#fff;font-size:13px;cursor:pointer}
+   234	.btn.ghost{background:transparent;color:var(--ink)}
+   235	.result{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:16px}
+   236	@media (max-width:760px){.result{grid-template-columns:1fr}}
+   237	canvas{width:100%;border:1px solid var(--line);border-radius:8px}
+   238	pre{margin:0;font:12.5px/1.5 ui-monospace,Consolas,monospace;
+   239	white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto}
+   240	table{width:100%;border-collapse:collapse;font-size:13px}
+   241	td,th{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+   242	th{color:var(--muted);font-weight:600;width:180px}
+   243	code{font:12.5px ui-monospace,Consolas,monospace;background:var(--accent-soft);
+   244	padding:1px 6px;border-radius:5px}
+   245	details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:12px}
+   246	.rowline{padding:5px 6px;border-bottom:1px solid var(--line);font-size:13.5px;cursor:pointer;
+   247	transition:background .35s cubic-bezier(.25,.46,.45,.94),border-color .35s cubic-bezier(.25,.46,.45,.94)}
+   248	.rowline:hover{background:#f0e8d8}
+   249	.rowline.sel{background:#f0e8d8;border-left:2px solid var(--accent);padding-left:4px;box-shadow:inset 2px 0 0 var(--accent)}
+   250	.rowline b{color:var(--accent);font-weight:600;margin-right:8px}
+   251	.rowline .conf{color:var(--muted);font-size:12px;float:right}
+   252	.rowline.low .conf{color:var(--warn)}
+   253	.statusbar{min-height:20px;color:var(--muted);font-size:13px;margin-top:10px}
+   254	</style></head><body><div class="wrap">
+   255	<h1>PaddleOCR service</h1>
+   256	<div class="sub">PP-OCR det+rec · Windows PC · LAN only · interactive API docs at
+   257	<a href="/docs">/docs</a> (Swagger) and <a href="/redoc">/redoc</a></div>
+   258	<div class="chips" id="chips">loading…</div>
+   259	
+   260	<div class="card"><h2>Try it</h2>
+   261	<div class="drop" id="drop">Drop an image here, or click to browse<br>
+   262	<small>PNG / JPG / WEBP</small>
+   263	<input type="file" id="file" accept="image/*" style="display:none"></div>
+   264	<div class="statusbar" id="status"></div>
+   265	<div class="result hidden" id="result">
+   266	<div><canvas id="canvas"></canvas></div>
+   267	<div><h2 id="linesTitle">Lines</h2><div id="lines"></div></div>
+   268	</div>
+   269	<details id="jsonwrap" style="display:none"><summary>Raw JSON response</summary>
+   270	<pre id="json"></pre></details>
+   271	</div>
+   272	
+   273	<div class="card"><h2>API cheatsheet</h2>
+   274	<table>
+   275	<tr><th>GET /health</th><td>JSON: status, device, versions, fallback_active, fallback_reason</td></tr>
+   276	<tr><th>POST /ocr</th><td>JSON body <code>{"image_b64": "...", "mime": "image/png"}</code> — same result shape, base64 in</td></tr>
+   277	<tr><th>POST /ocr/upload</th><td>multipart field <code>image</code> — result: <code>{text, lines:[{index,text,confidence,box}], elapsed_s, device}</code>; <code>box</code> is the 4-point polygon in source-image pixels</td></tr>
+   278	<tr><th>GET /docs</th><td>Interactive Swagger — run any endpoint from the browser</td></tr>
+   279	<tr><th>GET /logs</th><td>recent log lines (ring buffer, 300)</td></tr>
+   280	</table></div>
+   281	
+   282	<div class="card"><h2>Logs</h2>
+   283	<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">
+   284	<label style="font-size:13px;color:var(--muted)">
+   285	<input type="checkbox" id="livecheck" checked> live (2s)</label>
+   286	<button class="btn ghost" id="clearview">clear view</button>
+   287	</div>
+   288	<pre id="logs" style="max-height:260px">—</pre>
+   289	</div>
+   290	</div>
+   291	
+   292	<script>
+   293	const $=id=>document.getElementById(id);
+   294	const DROP_HTML=$('drop').innerHTML;
+   295	
+   296	async function health(){try{
+   297	  const d=await (await fetch('/health')).json();
+   298	  const chips=[['status',d.status],['device',d.device+(d.fallback_active?' · fallback':'')],
+   299	    ['models',(d.det_model||d.rec_model)?`${d.det_model||'default det'} + ${d.rec_model||'default rec'}`:'package default']];
+   300	  chips.push(['versions',`paddle ${d.paddle_version} · paddleocr ${d.paddleocr_version} · cuda ${d.paddle_compiled_with_cuda}`]);
+   301	  if(d.fallback_reason)chips.push(['reason',d.fallback_reason]);
+   302	  $('chips').innerHTML=chips.map(([k,v])=>
+   303	    `<span class="chip ${d.fallback_active&&k==='device'?'warn':''}">${k}: <b>${v}</b></span>`).join('');
+   304	}catch(e){$('chips').innerHTML='<span class="chip warn">service unreachable</span>';}}
+   305	health();setInterval(health,5000);
+   306	
+   307	const drop=$('drop'),file=$('file');
+   308	function bindDrop(){
+   309	  drop.innerHTML=DROP_HTML;
+   310	  drop.onclick=()=>document.getElementById('file').click();
+   311	  const nf=document.getElementById('file');
+   312	  nf.onchange=()=>{if(nf.files[0])run(nf.files[0]);};
+   313	}
+   314	bindDrop();
+   315	/* drag listeners ride on the drop element itself — attach once */
+   316	['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('on');}));
+   317	['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('on');}));
+   318	drop.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)run(f);});
+   319	
+   320	async function run(f){
+   321	  drop.innerHTML='<span style="opacity:.7">OCR running…</span>';
+   322	  $('status').textContent=f.name+' ('+(f.size/1024).toFixed(0)+' KB)';
+   323	  const fd=new FormData();fd.append('image',f);
+   324	  try{
+   325	    const r=await fetch('/ocr/upload',{method:'POST',body:fd});
+   326	    const d=await r.json();
+   327	    if(!r.ok){const msg=d.detail&&(d.detail.error||JSON.stringify(d.detail))||r.status;
+   328	      $('status').innerHTML='<span style="color:var(--warn)">Failed: '+msg+'</span>';
+   329	      $('result').classList.add('hidden');return;}
+   330	    $('status').textContent=`${d.lines.length} line${d.lines.length===1?'':'s'} · `+(d.elapsed_s*1000).toFixed(0)+' ms · device '+d.device;
+   331	    render(f,d);
+   332	  }catch(err){$('status').innerHTML='<span style="color:var(--warn)">Upload failed: '+err+'</span>';}
+   333	  finally{bindDrop();}
+   334	}
+   335	
+   336	function render(f,d){
+   337	  $('jsonwrap').style.display='';
+   338	  $('json').textContent=JSON.stringify(d,null,2);
+   339	  window.__res=d;window.__sel=null;
+   340	  const img=new Image();
+   341	  img.onload=()=>{window.__img=img;window.__scale=Math.min(1,760/img.naturalWidth);
+   342	    $('canvas').title='click a box to jump to its line';
+   343	    drawBoxes(null);};
+   344	  img.src=URL.createObjectURL(f);
+   345	  /* line rows */
+   346	  $('linesTitle').textContent='Lines ('+d.lines.length+')';
+   347	  $('lines').innerHTML=d.lines.map((ln,i)=>
+   348	    `<div class="rowline ${ln.confidence!=null&&ln.confidence<.9?'low':''}" data-i="${ln.index}">
+   349	     <b>${ln.index??i}</b>${(ln.confidence!=null?`<span class="conf">${(ln.confidence*100).toFixed(1)}%</span>`:'')}
+   350	     ${ln.text.replace(/</g,'&lt;')}</div>`).join('')
+   351	    ||'<div style="color:var(--muted)">No text found.</div>';
+   352	  /* copy full text */
+   353	  window.__text=d.text;
+   354	  $('result').classList.remove('hidden');
+   355	}
+   356	
+   357	/* box <-> line interactivity */
+   358	function drawBoxes(hi){
+   359	  const d=window.__res,img=window.__img;
+   360	  if(!d||!img||!window.__scale)return;
+   361	  const c=$('canvas'),s=window.__scale;
+   362	  c.width=img.naturalWidth*s;c.height=img.naturalHeight*s;
+   363	  const ctx=c.getContext('2d');
+   364	  ctx.drawImage(img,0,0,c.width,c.height);
+   365	  ctx.font=`${Math.max(10,11*s)}px ui-monospace,Consolas,monospace`;
+   366	  d.lines.forEach(ln=>{
+   367	    if(!ln.box)return;
+   368	    const active=(hi!=null&&ln.index===hi)||(window.__sel!=null&&ln.index===window.__sel);
+   369	    const p=ln.box.map(([x,y])=>[x*s,y*s]);
+   370	    ctx.beginPath();ctx.moveTo(p[0][0],p[0][1]);
+   371	    for(let i=1;i<4;i++)ctx.lineTo(p[i][0],p[i][1]);
+   372	    ctx.closePath();
+   373	    if(active){ctx.fillStyle='rgba(138,109,59,.34)';ctx.fill();}
+   374	    ctx.lineWidth=Math.max(1,(active?3.2:1.3)*s);
+   375	    ctx.strokeStyle=active?'rgba(166,124,46,1)':'rgba(138,109,59,.30)';
+   376	    ctx.stroke();
+   377	    if(active){ctx.fillStyle='rgba(166,124,46,1)';
+   378	      ctx.fillText('#'+ln.index,p[0][0],Math.max(11*s,p[0][1]-4));}
+   379	  });
+   380	}
+   381	function pointBoxDist(px,py,box){
+   382	  let inside=false,minD=1e9;
+   383	  for(let i=0;i<4;i++){
+   384	    const [x1,y1]=box[i],[x2,y2]=box[(i+1)%4];
+   385	    const dx=x2-x1,dy=y2-y1;
+   386	    const t=Math.max(0,Math.min(1,((px-x1)*dx+(py-y1)*dy)/((dx*dx+dy*dy)||1e-9)));
+   387	    const dd=Math.hypot(px-(x1+t*dx),py-(y1+t*dy));
+   388	    if(dd<minD)minD=dd;
+   389	    if(((y1>py)!==(y2>py))&&px<(x2-x1)*(py-y1)/((y2-y1)||1e-9)+x1)inside=!inside;
+   390	  }
+   391	  return inside?0:minD;
+   392	}
+   393	const LINES_=$('lines');
+   394	LINES_.addEventListener('mouseover',e=>{const row=e.target.closest('.rowline');if(row)drawBoxes(+row.dataset.i);});
+   395	LINES_.addEventListener('mouseout',e=>{if(!e.relatedTarget||!e.relatedTarget.closest('.rowline'))drawBoxes(null);});
+   396	LINES_.addEventListener('click',e=>{
+   397	  const row=e.target.closest('.rowline');if(!row)return;
+   398	  const i=+row.dataset.i;
+   399	  window.__sel=(window.__sel===i)?null:i;
+   400	  LINES_.querySelectorAll('.rowline').forEach(r=>r.classList.toggle('sel',+r.dataset.i===window.__sel));
+   401	  drawBoxes(null);
+   402	});
+   403	$('canvas').addEventListener('click',e=>{
+   404	  const c=$('canvas');
+   405	  if(!window.__res||!window.__scale)return;
+   406	  const rc=c.getBoundingClientRect();
+   407	  const px=(e.clientX-rc.left)*(c.width/rc.width);
+   408	  const py=(e.clientY-rc.top)*(c.height/rc.height);
+   409	  let best=null,bd=1e9;
+   410	  window.__res.lines.forEach(ln=>{if(!ln.box)return;
+   411	    const dd=pointBoxDist(px,py,ln.box);if(dd<bd){bd=dd;best=ln.index;}});
+   412	  if(best==null||bd>30)return;
+   413	  const row=LINES_.querySelector(`.rowline[data-i="${best}"]`);
+   414	  if(row){window.__sel=(window.__sel===best)?null:best;
+   415	    LINES_.querySelectorAll('.rowline').forEach(r=>r.classList.toggle('sel',+r.dataset.i===window.__sel));
+   416	    drawBoxes(null);row.scrollIntoView({block:'nearest',behavior:'smooth'});}
+   417	});
+   418	
+   419	/* logs */
+   420	let logsTimer=null;
+   421	async function refreshLogs(){
+   422	  try{const d=await (await fetch('/logs')).json();
+   423	      $('logs').textContent=d.lines.join('\\n')||'—';
+   424	      $('logs').scrollTop=$('logs').scrollHeight;}catch(e){}
+   425	}
+   426	function setLive(on){if(logsTimer){clearInterval(logsTimer);logsTimer=null;}if(on)logsTimer=setInterval(refreshLogs,2000);}
+   427	$('livecheck').onchange=e=>setLive(e.target.checked);
+   428	$('clearview').onclick=()=>{$('logs').textContent='—';};
+   429	setLive(true);refreshLogs();
+   430	</script></body></html>"""
+   431	
+   432	
+   433	@app.get("/", response_class=HTMLResponse)
+   434	def ui():
+   435	    return UI_HTML
+   436	
+   437	
+   438	@app.get("/logs")
+   439	def recent_logs():
+   440	    return {"count": len(LOGS), "lines": list(LOGS)}
+   441	
+   442	
+   443	def warm_predict(model) -> bool:
+   444	    """Run a tiny predict to prove the device actually works."""
+   445	    img = np.full((64, 200, 3), 255, dtype=np.uint8)
+   446	    cv2.putText(img, "warmup", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+   447	    try:
+   448	        model.predict(img)
+   449	        return True
+   450	    except Exception as exc:
+   451	        log(f"prewarm predict failed: {exc}")
+   452	        return False
+   453	
+   454	
+   455	def init_model(dev):
+   456	    kwargs = dict(
+   457	        lang=state["lang"],
+   458	        device=dev,
+   459	        enable_mkldnn=state["enable_mkldnn"],
+   460	        use_doc_orientation_classify=False,
+   461	        use_doc_unwarping=False,
+   462	        use_textline_orientation=False,
+   463	    )
+   464	    # Optional explicit model overrides. When set, paddleocr auto-downloads
+   465	    # the named model on first start. Note: explicit names make lang ignored.
+   466	    if state.get("det_model"):
+   467	        kwargs["text_detection_model_name"] = state["det_model"]
+   468	    if state.get("rec_model"):
+   469	        kwargs["text_recognition_model_name"] = state["rec_model"]
+   470	    return PaddleOCR(**kwargs)
+   471	
+   472	
+   473	def ensure_predict(img):
+   474	    """Predict, falling back to CPU once if a GPU run dies (init-time or runtime)."""
+   475	    if state["model"] is None:
+   476	        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   477	    try:
+   478	        return state["model"].predict(img)
+   479	    except Exception as exc:
+   480	        gpu_broken = state["device"] != "cpu" and state["requested_device"] == "auto"
+   481	        if not gpu_broken:
+   482	            raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)}) from exc
+   483	        log(f"GPU predict failed ({exc}); falling back to CPU")
+   484	        try:
+   485	            model = init_model("cpu")
+   486	            if not warm_predict(model):
+   487	                raise RuntimeError("CPU prewarm failed too")
+   488	            state["model"] = model
+   489	            state["device"] = "cpu"
+   490	            state["fallback_active"] = True
+   491	            state["fallback_reason"] = f"GPU runtime failure: {exc}"
+   492	            return model.predict(img)
+   493	        except Exception as exc2:
+   494	            raise HTTPException(
+   495	                status_code=500,
+   496	                detail={"error": "predict failed on GPU and CPU fallback", "detail": str(exc2)},
+   497	            ) from exc2
+   498	
+   499	
+   500	@app.on_event("startup")
+   501	def startup():
+   502	    req = state["requested_device"]
+   503	    if req == "auto":
+   504	        candidates = ["cpu"]
+   505	        if paddle.device.is_compiled_with_cuda():
+   506	            try:
+   507	                if paddle.device.cuda.device_count() > 0:
+   508	                    candidates = ["gpu:0", "cpu"]
+   509	            except Exception:
+   510	                pass
+   511	    else:
+   512	        candidates = [resolve_device(req)]
+   513	
+   514	    for i, dev in enumerate(candidates):
+   515	        try:
+   516	            model = init_model(dev)
+   517	            if not warm_predict(model):
+   518	                raise RuntimeError("prewarm predict failed")
+   519	            state["model"] = model
+   520	            state["device"] = dev
+   521	            state["warm"] = True
+   522	            state["fallback_active"] = i > 0
+   523	            state["fallback_reason"] = (
+   524	                f"GPU on this host not usable ({state['first_error']}), using {dev}" if i > 0 else None
+   525	            )
+   526	            log(f"initialized device={dev} lang={state['lang']} det={state['det_model'] or 'default'} "
+   527	                f"rec={state['rec_model'] or 'default'} mkldnn={state['enable_mkldnn']} "
+   528	                f"fallback_active={state['fallback_active']}")
+   529	            return
+   530	        except SystemExit:
+   531	            raise
+   532	        except Exception as exc:
+   533	            state["error"] = f"{dev}: {exc}"
+   534	            if i == 0:
+   535	                state["first_error"] = str(exc)
+   536	            log(f"init on {dev} failed: {exc}")
+   537	    log("all device candidates failed")
+   538	
+   539	
+   540	@app.on_event("shutdown")
+   541	def shutdown():
+   542	    log("service stopped")
+   543	
+   544	
+   545	if __name__ == "__main__":
+   546	    parser = argparse.ArgumentParser()
+   547	    parser.add_argument("--host", default="0.0.0.0")
+   548	    parser.add_argument("--port", type=int, default=8649)
+   549	    parser.add_argument("--device", default="auto",
+   550	                        help="auto = GPU first, automatic CPU fallback (init-time and runtime) | cpu | gpu | gpu:N")
+   551	    parser.add_argument("--lang", default="ch", help="ch (zh+en) | en | ja | ...")
+   552	    parser.add_argument("--det-model", default=None,
+   553	                        help="text_detection_model_name override (e.g. PP-OCRv6_server_det or a newer release). "
+   554	                             "Downloaded automatically on first start; empty = package default.")
+   555	    parser.add_argument("--rec-model", default=None,
+   556	                        help="text_recognition_model_name override (e.g. PP-OCRv6_server_rec). "
+   557	                             "Downloaded automatically on first start; empty = package default.")
+   558	    parser.add_argument("--mkldnn", action="store_true",
+   559	                        help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+   560	                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+   561	                             "not support' inside predict.")
+   562	    args = parser.parse_args()
+   563	    state["requested_device"] = args.device
+   564	    state["lang"] = args.lang
+   565	    state["det_model"] = args.det_model
+   566	    state["rec_model"] = args.rec_model
+   567	    state["enable_mkldnn"] = bool(args.mkldnn)
+   568	
+   569	    import uvicorn
+   570	
+
+exec
+/bin/bash -lc "nl -ba paddle_service_candidate.py | sed -n '1,240p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+exec
+/bin/bash -lc "nl -ba paddle_service_candidate.py | sed -n '240,490p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+exec
+/bin/bash -lc "nl -ba paddle_service_original.py | sed -n '1,230p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+     1	"""PaddleOCR service — FastAPI wrapper for the Windows PC.
+     2	
+     3	Engine chain (all PP-OCRv6_medium det+rec):
+     4	  1. paddle GPU  (paddlepaddle-gpu, ~0.05-0.34s/img)
+     5	  2. RapidOCR cpu (onnxruntime, separate venv child process, ~1.5-2.2s/img;
+     6	     lazy-spawned only after a GPU runtime failure)
+     7	  3. paddle CPU  (mkldnn off, ~7-9.5s/img; also re-runs when tier 2 output
+     8	     has any line below the tier-2 confidence gate)
+     9	
+    10	Devices:
+    11	  --device auto  GPU first (build + driver + real prewarm predict)
+    12	  --device cpu   force paddle CPU (chain disabled)
+    13	  --device gpu   force GPU, no fallback tiers
+    14	  --device gpu:N pin a specific CUDA device
+    15	Tier flags:
+    16	  --no-rapid            disable tier 2 (GPU -> paddle CPU only)
+    17	  --rapid-worker PATH   python.exe of the RapidOCR venv (tier 2)
+    18	  --rapid-worker-script PATH  rapid_worker.py (tier 2 child protocol)
+    19	  --conf-gate F         tier-2 min line confidence; below -> tier 3 re-run (default 0.70)
+    20	  --force-tier T        test/ops override: auto|gpu|paddle-cpu|rapidocr
+    21	Models:
+    22	  --det-model/--rec-model override packaged defaults (auto-downloaded; e.g. a newer release)
+    23	GUI:
+    24	  GET /       in-browser UI: upload + box preview + live logs + API cheatsheet
+    25	  GET /docs   FastAPI interactive Swagger UI
+    26	  GET /logs   recent log lines (ring buffer)
+    27	"""
+    28	import argparse
+    29	import base64
+    30	import binascii
+    31	import datetime as dt
+    32	import json
+    33	import logging
+    34	import os
+    35	import subprocess
+    36	import time
+    37	from collections import deque
+    38	
+    39	import cv2
+    40	import numpy as np
+    41	from fastapi import FastAPI, File, HTTPException, UploadFile
+    42	from fastapi.responses import HTMLResponse
+    43	from pydantic import BaseModel
+    44	
+    45	import paddle
+    46	import paddleocr
+    47	from paddleocr import PaddleOCR
+    48	
+    49	app = FastAPI(title="paddle-ocr-service")
+    50	state = {
+    51	    "model": None,
+    52	    "device": "uninitialized",
+    53	    "requested_device": "auto",
+    54	    "lang": "ch",
+    55	    "det_model": None,
+    56	    "rec_model": None,
+    57	    "enable_mkldnn": False,
+    58	    "fallback_active": False,
+    59	    "fallback_reason": None,
+    60	    "first_error": None,
+    61	    "warm": False,
+    62	    "error": None,
+    63	    # engine chain (tier 2 = RapidOCR child process)
+    64	    "force_tier": "auto",
+    65	    "conf_gate": 0.70,
+    66	    "rapid_worker": None,
+    67	    "rapid_worker_py": None,
+    68	    "rapid_worker_script": None,
+    69	    "rapid": {"uses": 0, "failures": 0, "gated": 0},
+    70	    "gpu_runtime_failures": 0,
+    71	}
+    72	
+    73	# --- ring log -------------------------------------------------------------
+    74	LOGS = deque(maxlen=300)
+    75	
+    76	
+    77	def log(msg: str, console: bool = True):
+    78	    line = f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
+    79	    LOGS.append(line)
+    80	    if console:
+    81	        print(line, flush=True)
+    82	
+    83	
+    84	class _RingHandler(logging.Handler):
+    85	    """Capture uvicorn/paddle log records into the ring buffer (no console echo)."""
+    86	
+    87	    def emit(self, record):
+    88	        try:
+    89	            log(f"[{record.levelname}] {record.getMessage()}", console=False)
+    90	        except Exception:
+    91	            pass
+    92	
+    93	
+    94	for _name in ("uvicorn", "uvicorn.access", "uvicorn.error", "paddleocr", "paddlex", "paddleocr.paddleocr"):
+    95	    logging.getLogger(_name).addHandler(_RingHandler())
+    96	
+    97	
+    98	class OcrJson(BaseModel):
+    99	    image_b64: str
+   100	    mime: str | None = None
+   101	
+   102	
+   103	def resolve_device(requested: str) -> str:
+   104	    """Map CLI arg to a paddle device string."""
+   105	    if requested == "cpu":
+   106	        return "cpu"
+   107	    compiled = paddle.device.is_compiled_with_cuda()
+   108	    count = 0
+   109	    if compiled:
+   110	        try:
+   111	            count = paddle.device.cuda.device_count()
+   112	        except Exception:
+   113	            count = 0
+   114	    if requested == "auto":
+   115	        return "gpu:0" if compiled and count > 0 else "cpu"
+   116	    if requested == "gpu":
+   117	        if not compiled:
+   118	            raise SystemExit("GPU requested but this paddle build is CPU-only (paddlepaddle, not paddlepaddle-gpu). Reinstall with a GPU wheel.")
+   119	        return "gpu:0"
+   120	    if requested.startswith("gpu:"):
+   121	        if not compiled:
+   122	            raise SystemExit(f"GPU requested ({requested}) but this paddle build is CPU-only.")
+   123	        return requested
+   124	    raise SystemExit(f"Unknown device {requested!r} (use auto|cpu|gpu|gpu:N)")
+   125	
+   126	
+   127	def get_model():
+   128	    model = state["model"]
+   129	    if model is None:
+   130	        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   131	    return model
+   132	
+   133	
+   134	def result_fields(res) -> dict:
+   135	    """Pull text/score/box fields from a paddleocr 3.x OCRResult, defensively."""
+   136	    texts = scores = polys = None
+   137	    try:
+   138	        texts = res["rec_texts"]
+   139	        scores = res["rec_scores"]
+   140	        polys = res["rec_polys"]
+   141	    except Exception:
+   142	        try:
+   143	            j = res.json["res"]
+   144	            texts, scores, polys = j["rec_texts"], j["rec_scores"], j["rec_polys"]
+   145	        except Exception:
+   146	            pass
+   147	    if texts is None:
+   148	        return {"lines": [], "text": ""}
+   149	    lines = []
+   150	    for i, t in enumerate(texts):
+   151	        score = float(scores[i]) if scores is not None and i < len(scores) else None
+   152	        poly = polys[i] if polys is not None and i < len(polys) else None
+   153	        box = [[float(pt[0]), float(pt[1])] for pt in poly] if poly is not None else None
+   154	        lines.append({"index": i, "text": str(t), "confidence": score, "box": box})
+   155	    return {"lines": lines, "text": "\n".join(str(t) for t in texts)}
+   156	
+   157	
+   158	def _run_one(image_bytes: bytes, filename: str | None) -> dict:
+   159	    """Shared handler body for both /ocr and /ocr/upload."""
+   160	    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+   161	    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+   162	    if img is None:
+   163	        raise HTTPException(status_code=400, detail=f"cannot decode image (filename={filename!r})")
+   164	    t0 = time.time()
+   165	    try:
+   166	        fields, device_label = ensure_fields(img)
+   167	    except HTTPException:
+   168	        raise
+   169	    except Exception as exc:
+   170	        raise HTTPException(status_code=500, detail={"error": "predict failed", "detail": str(exc)})
+   171	    elapsed = time.time() - t0
+   172	    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={device_label}", console=False)
+   173	    return {
+   174	        "text": fields["text"],
+   175	        "lines": fields["lines"],
+   176	        "elapsed_s": round(elapsed, 3),
+   177	        "device": device_label,
+   178	    }
+   179	
+   180	
+   181	# --- tier 2: RapidOCR child process ----------------------------------------
+   182	
+   183	
+   184	class RapidWorker:
+   185	    """Persistent rapid_worker.py child process, line-JSON protocol.
+   186	
+   187	    Child prints 'READY' once its engine is loaded, then one 'OCR {json}' line
+   188	    per request. Any other stdout line is skipped as child-side noise.
+   189	    """
+   190	
+   191	    def __init__(self, python_exe: str, script_path: str):
+   192	        self.python_exe = python_exe
+   193	        self.script_path = script_path
+   194	        self.proc = None
+   195	
+   196	    def _spawn(self):
+   197	        self.proc = subprocess.Popen(
+   198	            [self.python_exe, self.script_path],
+   199	            stdin=subprocess.PIPE,
+   200	            stdout=subprocess.PIPE,
+   201	            text=True,
+   202	            encoding="utf-8",
+   203	            cwd=os.path.dirname(os.path.abspath(self.script_path)) or None,
+   204	        )
+   205	        line = self.proc.stdout.readline()
+   206	        if line.strip() != "READY":
+   207	            raise RuntimeError(f"rapid worker handshake failed: {line[:200]!r}")
+   208	        log("rapidocr tier spawned")
+   209	
+   210	    def call(self, img: np.ndarray) -> dict | None:
+   211	        """Run OCR on a decoded BGR array. Returns fields dict or None on failure."""
+   212	        ok, buf = cv2.imencode(".png", img)
+   213	        if not ok:
+   214	            return None
+   215	        payload = json.dumps({"image": base64.b64encode(buf.tobytes()).decode("ascii")})
+   216	        for attempt in (1, 2):  # one respawn allowed within a single request
+   217	            try:
+   218	                if self.proc is None or self.proc.poll() is not None:
+   219	                    self.proc = None
+   220	                    self._spawn()
+   221	                self.proc.stdin.write(payload + "\n")
+   222	                self.proc.stdin.flush()
+   223	                while True:
+   224	                    line = self.proc.stdout.readline()
+   225	                    if not line:  # child died
+   226	                        raise RuntimeError("rapid worker stdout closed")
+   227	                    if line.startswith("OCR "):
+   228	                        resp = json.loads(line[4:])
+   229	                        if resp.get("ok"):
+   230	                            return {"lines": resp["lines"], "text": resp["text"]}
+   231	                        raise RuntimeError(f"rapid worker error: {resp.get('error')}")
+   232	                    # skip noise lines
+   233	                return None
+   234	            except Exception as exc:
+   235	                state["rapid"]["failures"] += 1
+   236	                log(f"rapidocr tier attempt {attempt} failed: {exc}")
+   237	                try:
+   238	                    if self.proc is not None:
+   239	                        self.proc.kill()
+   240	                except Exception:
+
+ succeeded in 0ms:
+     1	"""PaddleOCR service — FastAPI wrapper for the Windows PC.
+     2	
+     3	Runs the paddleocr 3.x defaults (PP-OCRv6 det+rec). One script, one port:
+     4	GPU build -> serves fast OCR with automatic CPU fallback.
+     5	
+     6	Devices:
+     7	  --device auto  GPU first (build + driver + real prewarm predict), CPU fallback
+     8	  --device cpu   force CPU
+     9	  --device gpu   force GPU (gpu:0)
+    10	  --device gpu:N pin a specific CUDA device
+    11	Models:
+    12	  --det-model/--rec-model override packaged defaults (auto-downloaded; e.g. a newer release)
+    13	GUI:
+    14	  GET /       in-browser UI: upload + box preview + live logs + API cheatsheet
+    15	  GET /docs   FastAPI interactive Swagger UI
+    16	  GET /logs   recent log lines (ring buffer)
+    17	"""
+    18	import argparse
+    19	import base64
+    20	import binascii
+    21	import datetime as dt
+    22	import logging
+    23	import time
+    24	from collections import deque
+    25	
+    26	import cv2
+    27	import numpy as np
+    28	from fastapi import FastAPI, File, HTTPException, UploadFile
+    29	from fastapi.responses import HTMLResponse
+    30	from pydantic import BaseModel
+    31	
+    32	import paddle
+    33	import paddleocr
+    34	from paddleocr import PaddleOCR
+    35	
+    36	app = FastAPI(title="paddle-ocr-service")
+    37	state = {
+    38	    "model": None,
+    39	    "device": "uninitialized",
+    40	    "requested_device": "auto",
+    41	    "lang": "ch",
+    42	    "det_model": None,
+    43	    "rec_model": None,
+    44	    "enable_mkldnn": False,
+    45	    "fallback_active": False,
+    46	    "fallback_reason": None,
+    47	    "first_error": None,
+    48	    "warm": False,
+    49	    "error": None,
+    50	}
+    51	
+    52	# --- ring log -------------------------------------------------------------
+    53	LOGS = deque(maxlen=300)
+    54	
+    55	
+    56	def log(msg: str, console: bool = True):
+    57	    line = f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
+    58	    LOGS.append(line)
+    59	    if console:
+    60	        print(line, flush=True)
+    61	
+    62	
+    63	class _RingHandler(logging.Handler):
+    64	    """Capture uvicorn/paddle log records into the ring buffer (no console echo)."""
+    65	
+    66	    def emit(self, record):
+    67	        try:
+    68	            log(f"[{record.levelname}] {record.getMessage()}", console=False)
+    69	        except Exception:
+    70	            pass
+    71	
+    72	
+    73	for _name in ("uvicorn", "uvicorn.access", "uvicorn.error", "paddleocr", "paddlex", "paddleocr.paddleocr"):
+    74	    logging.getLogger(_name).addHandler(_RingHandler())
+    75	
+    76	
+    77	class OcrJson(BaseModel):
+    78	    image_b64: str
+    79	    mime: str | None = None
+    80	
+    81	
+    82	def resolve_device(requested: str) -> str:
+    83	    """Map CLI arg to a paddle device string."""
+    84	    if requested == "cpu":
+    85	        return "cpu"
+    86	    compiled = paddle.device.is_compiled_with_cuda()
+    87	    count = 0
+    88	    if compiled:
+    89	        try:
+    90	            count = paddle.device.cuda.device_count()
+    91	        except Exception:
+    92	            count = 0
+    93	    if requested == "auto":
+    94	        return "gpu:0" if compiled and count > 0 else "cpu"
+    95	    if requested == "gpu":
+    96	        if not compiled:
+    97	            raise SystemExit("GPU requested but this paddle build is CPU-only (paddlepaddle, not paddlepaddle-gpu). Reinstall with a GPU wheel.")
+    98	        return "gpu:0"
+    99	    if requested.startswith("gpu:"):
+   100	        if not compiled:
+   101	            raise SystemExit(f"GPU requested ({requested}) but this paddle build is CPU-only.")
+   102	        return requested
+   103	    raise SystemExit(f"Unknown device {requested!r} (use auto|cpu|gpu|gpu:N)")
+   104	
+   105	
+   106	def get_model():
+   107	    model = state["model"]
+   108	    if model is None:
+   109	        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   110	    return model
+   111	
+   112	
+   113	def result_fields(res) -> dict:
+   114	    """Pull text/score/box fields from a paddleocr 3.x OCRResult, defensively."""
+   115	    texts = scores = polys = None
+   116	    try:
+   117	        texts = res["rec_texts"]
+   118	        scores = res["rec_scores"]
+   119	        polys = res["rec_polys"]
+   120	    except Exception:
+   121	        try:
+   122	            j = res.json["res"]
+   123	            texts, scores, polys = j["rec_texts"], j["rec_scores"], j["rec_polys"]
+   124	        except Exception:
+   125	            pass
+   126	    if texts is None:
+   127	        return {"lines": [], "text": ""}
+   128	    lines = []
+   129	    for i, t in enumerate(texts):
+   130	        score = float(scores[i]) if scores is not None and i < len(scores) else None
+   131	        poly = polys[i] if polys is not None and i < len(polys) else None
+   132	        box = [[float(pt[0]), float(pt[1])] for pt in poly] if poly is not None else None
+   133	        lines.append({"index": i, "text": str(t), "confidence": score, "box": box})
+   134	    return {"lines": lines, "text": "\n".join(str(t) for t in texts)}
+   135	
+   136	
+   137	def _run_one(image_bytes: bytes, filename: str | None) -> dict:
+   138	    """Shared handler body for both /ocr and /ocr/upload."""
+   139	    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+   140	    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+   141	    if img is None:
+   142	        raise HTTPException(status_code=400, detail=f"cannot decode image (filename={filename!r})")
+   143	    t0 = time.time()
+   144	    try:
+   145	        results = ensure_predict(img)
+   146	    except HTTPException:
+   147	        raise
+   148	    except Exception as exc:
+   149	        raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)})
+   150	    elapsed = time.time() - t0
+   151	    fields = result_fields(results[0]) if results else {"lines": [], "text": ""}
+   152	    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={state['device']}", console=False)
+   153	    return {
+   154	        "text": fields["text"],
+   155	        "lines": fields["lines"],
+   156	        "elapsed_s": round(elapsed, 3),
+   157	        "device": state["device"],
+   158	    }
+   159	
+   160	
+   161	@app.get("/health")
+   162	def health():
+   163	    return {
+   164	        "status": "ok" if state["model"] is not None else "warming",
+   165	        "service": "paddle-ocr-service",
+   166	        "device": state["device"],
+   167	        "device_requested": state["requested_device"],
+   168	        "lang": state["lang"],
+   169	        "det_model": state["det_model"],
+   170	        "rec_model": state["rec_model"],
+   171	        "enable_mkldnn": state["enable_mkldnn"],
+   172	        "model_initialized": state["model"] is not None,
+   173	        "warm": state["warm"],
+   174	        "fallback_active": state["fallback_active"],
+   175	        "fallback_reason": state["fallback_reason"],
+   176	        "init_error": state["error"],
+   177	        "paddle_version": paddle.__version__,
+   178	        "paddleocr_version": paddleocr.__version__,
+   179	        "paddle_compiled_with_cuda": paddle.device.is_compiled_with_cuda(),
+   180	    }
+   181	
+   182	
+   183	@app.post("/ocr")
+   184	async def ocr_json(body: OcrJson):
+   185	    get_model()
+   186	    img_bytes = decode_image_bytes(body.image_b64, body.mime)
+   187	    return _run_one(img_bytes, None)
+   188	
+   189	
+   190	def decode_image_bytes(raw_b64: str, mime: str | None) -> bytes:
+   191	    try:
+   192	        raw = base64.b64decode(raw_b64, validate=True)
+   193	    except (binascii.Error, ValueError):
+   194	        raise HTTPException(status_code=400, detail="image_b64 is not valid base64")
+   195	    return raw
+   196	
+   197	
+   198	@app.post("/ocr/upload")
+   199	async def ocr_upload(image: UploadFile = File(...)):
+   200	    get_model()
+   201	    raw = await image.read()
+   202	    return _run_one(raw, image.filename)
+   203	
+   204	# --- GUI + logs -----------------------------------------------------------
+   205	UI_HTML = """<!doctype html>
+   206	<html lang="en"><head><meta charset="utf-8">
+   207	<meta name="viewport" content="width=device-width,initial-scale=1">
+   208	<title>PaddleOCR service</title>
+   209	<style>
+   210	:root{--bg:#faf9f7;--panel:#fff;--ink:#1f1d1a;--muted:#6b675f;--line:#e6e2da;
+   211	--accent:#8a6d3b;--accent-soft:#f4efe6;--warn:#a1541c}
+   212	*{box-sizing:border-box}
+   213	body{margin:0;background:var(--bg);color:var(--ink);
+   214	font:15px/1.55 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
+   215	.wrap{max-width:980px;margin:0 auto;padding:36px 20px 64px}
+   216	h1{font-size:20px;font-weight:600;margin:0 0 2px}
+   217	.sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+   218	.sub a{color:var(--accent)}
+   219	.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}
+   220	.chip{font-size:12px;padding:4px 12px;border:1px solid var(--line);
+   221	border-radius:999px;background:var(--panel)}
+   222	.chip b{font-weight:600}
+   223	.chip.warn b{color:var(--warn)}
+   224	.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+   225	padding:20px 22px;margin-bottom:18px}
+   226	.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;
+   227	color:var(--muted);font-weight:600;margin:0 0 12px}
+   228	.drop{border:1.5px dashed var(--line);border-radius:10px;padding:36px 16px;
+   229	text-align:center;color:var(--muted);cursor:pointer;
+   230	transition:border-color .5s cubic-bezier(.25,.46,.45,.94),background .5s cubic-bezier(.25,.46,.45,.94)}
+
+ succeeded in 0ms:
+   240	                except Exception:
+   241	                    pass
+   242	                self.proc = None
+   243	        return None
+   244	
+   245	    def stop(self):
+   246	        try:
+   247	            if self.proc is not None:
+   248	                self.proc.kill()
+   249	        except Exception:
+   250	            pass
+   251	        self.proc = None
+   252	
+   253	
+   254	def rapid_fields(img: np.ndarray) -> tuple[dict | None, str]:
+   255	    """Tier 2 attempt. Returns (fields, 'rapidocr-cpu') or (None, reason)."""
+   256	    w = state["rapid_worker"]
+   257	    if w is None:
+   258	        return None, "tier2 disabled"
+   259	    state["rapid"]["uses"] += 1
+   260	    fields = w.call(img)
+   261	    if fields is None:
+   262	        return None, "tier2 call failed"
+   263	    confs = [ln["confidence"] for ln in fields["lines"] if ln.get("confidence") is not None]
+   264	    min_conf = min(confs) if confs else 0.0
+   265	    if min_conf < state["conf_gate"]:
+   266	        state["rapid"]["gated"] += 1
+   267	        log(f"tier2 min_conf {min_conf:.3f} < gate {state['conf_gate']}; re-running on paddle CPU")
+   268	        return None, f"tier2 conf gate (min_conf {min_conf:.3f})"
+   269	    return fields, "rapidocr-cpu"
+   270	
+   271	
+   272	def tier3_fields(img: np.ndarray, reason: str) -> tuple[dict, str]:
+   273	    """Tier 3: paddle CPU (existing standby path, lazily initialized)."""
+   274	    if state["device"] == "cpu" and state["model"] is not None:
+   275	        res = state["model"].predict(img)
+   276	        return result_fields(res[0]), "cpu"
+   277	    if state["model"] is None or state["device"] != "cpu":
+   278	        log(f"initializing paddle CPU tier 3 ({reason})")
+   279	        model = init_model("cpu")
+   280	        if not warm_predict(model):
+   281	            raise HTTPException(status_code=500, detail={"error": "predict failed: paddle CPU fallback prewarm failed"})
+   282	        state["model"] = model
+   283	        state["device"] = "cpu"
+   284	        state["fallback_active"] = True
+   285	        state["fallback_reason"] = reason
+   286	    state["fallback_active"] = True
+   287	    if not state["fallback_reason"]:
+   288	        state["fallback_reason"] = reason
+   289	    res = state["model"].predict(img)
+   290	    return result_fields(res[0]), "cpu"
+   291	
+   292	
+   293	def ensure_fields(img: np.ndarray) -> tuple[dict, str]:
+   294	    """Engine chain. Returns (fields, device_label). Raises HTTPException only if everything fails."""
+   295	    ft = state["force_tier"]
+   296	    if ft == "rapidocr":
+   297	        fields, why = rapid_fields(img)
+   298	        if fields is not None:
+   299	            return fields, why
+   300	        return tier3_fields(img, f"tier2 unavailable ({why})")
+   301	    if ft == "paddle-cpu":
+   302	        return tier3_fields(img, "forced paddle-cpu")
+   303	    if ft == "gpu":
+   304	        if state["model"] is None:
+   305	            raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   306	        res = state["model"].predict(img)
+   307	        return result_fields(res[0]), state["device"]
+   308	    if state["model"] is None:
+   309	        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   310	    if state["device"] == "cpu":
+   311	        # booted on CPU by request: chain ends here (paddle CPU is the last tier)
+   312	        res = state["model"].predict(img)
+   313	        return result_fields(res[0]), "cpu"
+   314	    # tier 1: paddle GPU. Per-request retry keeps auto-recovery: a transient
+   315	    # VRAM conflict repairs itself on the next request without a restart.
+   316	    try:
+   317	        res = state["model"].predict(img)
+   318	        return result_fields(res[0]), state["device"]
+   319	    except Exception as exc:
+   320	        state["gpu_runtime_failures"] += 1
+   321	        reason = f"GPU runtime failure ({state['gpu_runtime_failures']}): {exc}"
+   322	        state["fallback_reason"] = reason
+   323	        log(f"{reason}; descending engine chain")
+   324	        fields, why = rapid_fields(img)
+   325	        if fields is not None:
+   326	            return fields, "rapidocr-cpu"
+   327	        return tier3_fields(img, f"tier 2 unavailable ({why}); {reason}")
+   328	
+   329	
+   330	@app.get("/health")
+   331	def health():
+   332	    ready = state["model"] is not None or state["force_tier"] == "rapidocr"
+   333	    w = state["rapid_worker"]
+   334	    return {
+   335	        "status": "ok" if ready else "warming",
+   336	        "service": "paddle-ocr-service",
+   337	        "device": state["device"],
+   338	        "device_requested": state["requested_device"],
+   339	        "lang": state["lang"],
+   340	        "det_model": state["det_model"],
+   341	        "rec_model": state["rec_model"],
+   342	        "enable_mkldnn": state["enable_mkldnn"],
+   343	        "model_initialized": state["model"] is not None,
+   344	        "warm": state["warm"],
+   345	        "fallback_active": state["fallback_active"],
+   346	        "fallback_reason": state["fallback_reason"],
+   347	        "init_error": state["error"],
+   348	        "paddle_version": paddle.__version__,
+   349	        "paddleocr_version": paddleocr.__version__,
+   350	        "paddle_compiled_with_cuda": paddle.device.is_compiled_with_cuda(),
+   351	        "force_tier": state["force_tier"],
+   352	        "engine_chain": engine_chain(),
+   353	        "conf_gate": state["conf_gate"],
+   354	        "rapid_worker": {
+   355	            "enabled": w is not None,
+   356	            "python": state["rapid_worker_py"],
+   357	            "script": state["rapid_worker_script"],
+   358	            "spawned": bool(w and w.proc is not None and w.proc.poll() is None),
+   359	            **state["rapid"],
+   360	        },
+   361	        "gpu_runtime_failures": state["gpu_runtime_failures"],
+   362	    }
+   363	
+   364	
+   365	def engine_chain() -> list[str]:
+   366	    if state["force_tier"] == "rapidocr":
+   367	        tiers = ["rapidocr-cpu", "paddle-cpu"]
+   368	    elif state["force_tier"] == "paddle-cpu":
+   369	        tiers = ["paddle-cpu"]
+   370	    elif state["force_tier"] == "gpu":
+   371	        tiers = ["paddle-gpu"]
+   372	    elif state["rapid_worker"] is not None:
+   373	        tiers = ["paddle-gpu", "rapidocr-cpu", "paddle-cpu"]
+   374	    else:
+   375	        tiers = ["paddle-gpu", "paddle-cpu"]
+   376	    return tiers
+   377	
+   378	
+   379	def check_ready():
+   380	    if state["force_tier"] == "rapidocr":
+   381	        if state["rapid_worker"] is None:
+   382	            raise HTTPException(status_code=503, detail={"error": "rapidocr tier not configured (worker missing)"})
+   383	        return
+   384	    get_model()
+   385	
+   386	
+   387	@app.post("/ocr")
+   388	async def ocr_json(body: OcrJson):
+   389	    check_ready()
+   390	    img_bytes = decode_image_bytes(body.image_b64, body.mime)
+   391	    return _run_one(img_bytes, None)
+   392	
+   393	
+   394	def decode_image_bytes(raw_b64: str, mime: str | None) -> bytes:
+   395	    try:
+   396	        raw = base64.b64decode(raw_b64, validate=True)
+   397	    except (binascii.Error, ValueError):
+   398	        raise HTTPException(status_code=400, detail="image_b64 is not valid base64")
+   399	    return raw
+   400	
+   401	
+   402	@app.post("/ocr/upload")
+   403	async def ocr_upload(image: UploadFile = File(...)):
+   404	    check_ready()
+   405	    raw = await image.read()
+   406	    return _run_one(raw, image.filename)
+   407	
+   408	
+   409	# --- GUI + logs -----------------------------------------------------------
+   410	UI_HTML = """<!doctype html>
+   411	<html lang="en"><head><meta charset="utf-8">
+   412	<meta name="viewport" content="width=device-width,initial-scale=1">
+   413	<title>PaddleOCR service</title>
+   414	<style>
+   415	:root{--bg:#faf9f7;--panel:#fff;--ink:#1f1d1a;--muted:#6b675f;--line:#e6e2da;
+   416	--accent:#8a6d3b;--accent-soft:#f4efe6;--warn:#a1541c}
+   417	*{box-sizing:border-box}
+   418	body{margin:0;background:var(--bg);color:var(--ink);
+   419	font:15px/1.55 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
+   420	.wrap{max-width:980px;margin:0 auto;padding:36px 20px 64px}
+   421	h1{font-size:20px;font-weight:600;margin:0 0 2px}
+   422	.sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+   423	.sub a{color:var(--accent)}
+   424	.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}
+   425	.chip{font-size:12px;padding:4px 12px;border:1px solid var(--line);
+   426	border-radius:999px;background:var(--panel)}
+   427	.chip b{font-weight:600}
+   428	.chip.warn b{color:var(--warn)}
+   429	.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+   430	padding:20px 22px;margin-bottom:18px}
+   431	.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;
+   432	color:var(--muted);font-weight:600;margin:0 0 12px}
+   433	.drop{border:1.5px dashed var(--line);border-radius:10px;padding:36px 16px;
+   434	text-align:center;color:var(--muted);cursor:pointer;
+   435	transition:border-color .5s cubic-bezier(.25,.46,.45,.94),background .5s cubic-bezier(.25,.46,.45,.94)}
+   436	.drop:hover,.drop.on{border-color:var(--accent);background:var(--accent-soft);color:var(--ink)}
+   437	.btn{display:inline-block;padding:6px 14px;border:1px solid var(--ink);
+   438	border-radius:8px;background:var(--ink);color:#fff;font-size:13px;cursor:pointer}
+   439	.btn.ghost{background:transparent;color:var(--ink)}
+   440	.result{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:16px}
+   441	@media (max-width:760px){.result{grid-template-columns:1fr}}
+   442	canvas{width:100%;border:1px solid var(--line);border-radius:8px}
+   443	pre{margin:0;font:12.5px/1.5 ui-monospace,Consolas,monospace;
+   444	white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto}
+   445	table{width:100%;border-collapse:collapse;font-size:13px}
+   446	td,th{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+   447	th{color:var(--muted);font-weight:600;width:180px}
+   448	code{font:12.5px ui-monospace,Consolas,monospace;background:var(--accent-soft);
+   449	padding:1px 6px;border-radius:5px}
+   450	details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:12px}
+   451	.rowline{padding:5px 6px;border-bottom:1px solid var(--line);font-size:13.5px;cursor:pointer;
+   452	transition:background .35s cubic-bezier(.25,.46,.45,.94),border-color .35s cubic-bezier(.25,.46,.45,.94)}
+   453	.rowline:hover{background:#f0e8d8}
+   454	.rowline.sel{background:#f0e8d8;border-left:2px solid var(--accent);padding-left:4px;box-shadow:inset 2px 0 0 var(--accent)}
+   455	.rowline b{color:var(--accent);font-weight:600;margin-right:8px}
+   456	.rowline .conf{color:var(--muted);font-size:12px;float:right}
+   457	.rowline.low .conf{color:var(--warn)}
+   458	.statusbar{min-height:20px;color:var(--muted);font-size:13px;margin-top:10px}
+   459	</style></head><body><div class="wrap">
+   460	<h1>PaddleOCR service</h1>
+   461	<div class="sub">PP-OCR det+rec · Windows PC · LAN only · interactive API docs at
+   462	<a href="/docs">/docs</a> (Swagger) and <a href="/redoc">/redoc</a></div>
+   463	<div class="chips" id="chips">loading…</div>
+   464	
+   465	<div class="card"><h2>Try it</h2>
+   466	<div class="drop" id="drop">Drop an image here, or click to browse<br>
+   467	<small>PNG / JPG / WEBP</small>
+   468	<input type="file" id="file" accept="image/*" style="display:none"></div>
+   469	<div class="statusbar" id="status"></div>
+   470	<div class="result hidden" id="result">
+   471	<div><canvas id="canvas"></canvas></div>
+   472	<div><h2 id="linesTitle">Lines</h2><div id="lines"></div></div>
+   473	</div>
+   474	<details id="jsonwrap" style="display:none"><summary>Raw JSON response</summary>
+   475	<pre id="json"></pre></details>
+   476	</div>
+   477	
+   478	<div class="card"><h2>API cheatsheet</h2>
+   479	<table>
+   480	<tr><th>GET /health</th><td>JSON: status, device, versions, fallback_active, fallback_reason</td></tr>
+   481	<tr><th>POST /ocr</th><td>JSON body <code>{"image_b64": "...", "mime": "image/png"}</code> — same result shape, base64 in</td></tr>
+   482	<tr><th>POST /ocr/upload</th><td>multipart field <code>image</code> — result: <code>{text, lines:[{index,text,confidence,box}], elapsed_s, device}</code>; <code>box</code> is the 4-point polygon in source-image pixels</td></tr>
+   483	<tr><th>GET /docs</th><td>Interactive Swagger — run any endpoint from the browser</td></tr>
+   484	<tr><th>GET /logs</th><td>recent log lines (ring buffer, 300)</td></tr>
+   485	</table></div>
+   486	
+   487	<div class="card"><h2>Logs</h2>
+   488	<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">
+   489	<label style="font-size:13px;color:var(--muted)">
+   490	<input type="checkbox" id="livecheck" checked> live (2s)</label>
+
+exec
+/bin/bash -lc "nl -ba paddle_service_candidate.py | sed -n '490,788p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+   490	<input type="checkbox" id="livecheck" checked> live (2s)</label>
+   491	<button class="btn ghost" id="clearview">clear view</button>
+   492	</div>
+   493	<pre id="logs" style="max-height:260px">—</pre>
+   494	</div>
+   495	</div>
+   496	
+   497	<script>
+   498	const $=id=>document.getElementById(id);
+   499	const DROP_HTML=$('drop').innerHTML;
+   500	
+   501	async function health(){try{
+   502	  const d=await (await fetch('/health')).json();
+   503	  const chips=[['status',d.status],['device',d.device+(d.fallback_active?' · fallback':'')],
+   504	    ['models',(d.det_model||d.rec_model)?`${d.det_model||'default det'} + ${d.rec_model||'default rec'}`:'package default']];
+   505	  chips.push(['versions',`paddle ${d.paddle_version} · paddleocr ${d.paddleocr_version} · cuda ${d.paddle_compiled_with_cuda}`]);
+   506	  if(d.fallback_reason)chips.push(['reason',d.fallback_reason]);
+   507	  $('chips').innerHTML=chips.map(([k,v])=>
+   508	    `<span class="chip ${d.fallback_active&&k==='device'?'warn':''}">${k}: <b>${v}</b></span>`).join('');
+   509	}catch(e){$('chips').innerHTML='<span class="chip warn">service unreachable</span>';}}
+   510	health();setInterval(health,5000);
+   511	
+   512	const drop=$('drop'),file=$('file');
+   513	function bindDrop(){
+   514	  drop.innerHTML=DROP_HTML;
+   515	  drop.onclick=()=>document.getElementById('file').click();
+   516	  const nf=document.getElementById('file');
+   517	  nf.onchange=()=>{if(nf.files[0])run(nf.files[0]);};
+   518	}
+   519	bindDrop();
+   520	/* drag listeners ride on the drop element itself — attach once */
+   521	['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('on');}));
+   522	['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('on');}));
+   523	drop.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)run(f);});
+   524	
+   525	async function run(f){
+   526	  drop.innerHTML='<span style="opacity:.7">OCR running…</span>';
+   527	  $('status').textContent=f.name+' ('+(f.size/1024).toFixed(0)+' KB)';
+   528	  const fd=new FormData();fd.append('image',f);
+   529	  try{
+   530	    const r=await fetch('/ocr/upload',{method:'POST',body:fd});
+   531	    const d=await r.json();
+   532	    if(!r.ok){const msg=d.detail&&(d.detail.error||JSON.stringify(d.detail))||r.status;
+   533	      $('status').innerHTML='<span style="color:var(--warn)">Failed: '+msg+'</span>';
+   534	      $('result').classList.add('hidden');return;}
+   535	    $('status').textContent=`${d.lines.length} line${d.lines.length===1?'':'s'} · `+(d.elapsed_s*1000).toFixed(0)+' ms · device '+d.device;
+   536	    render(f,d);
+   537	  }catch(err){$('status').innerHTML='<span style="color:var(--warn)">Upload failed: '+err+'</span>';}
+   538	  finally{bindDrop();}
+   539	}
+   540	
+   541	function render(f,d){
+   542	  $('jsonwrap').style.display='';
+   543	  $('json').textContent=JSON.stringify(d,null,2);
+   544	  window.__res=d;window.__sel=null;
+   545	  const img=new Image();
+   546	  img.onload=()=>{window.__img=img;window.__scale=Math.min(1,760/img.naturalWidth);
+   547	    $('canvas').title='click a box to jump to its line';
+   548	    drawBoxes(null);};
+   549	  img.src=URL.createObjectURL(f);
+   550	  /* line rows */
+   551	  $('linesTitle').textContent='Lines ('+d.lines.length+')';
+   552	  $('lines').innerHTML=d.lines.map((ln,i)=>
+   553	    `<div class="rowline ${ln.confidence!=null&&ln.confidence<.9?'low':''}" data-i="${ln.index}">
+   554	     <b>${ln.index??i}</b>${(ln.confidence!=null?`<span class="conf">${(ln.confidence*100).toFixed(1)}%</span>`:'')}
+   555	     ${ln.text.replace(/</g,'&lt;')}</div>`).join('')
+   556	    ||'<div style="color:var(--muted)">No text found.</div>';
+   557	  /* copy full text */
+   558	  window.__text=d.text;
+   559	  $('result').classList.remove('hidden');
+   560	}
+   561	
+   562	/* box <-> line interactivity */
+   563	function drawBoxes(hi){
+   564	  const d=window.__res,img=window.__img;
+   565	  if(!d||!img||!window.__scale)return;
+   566	  const c=$('canvas'),s=window.__scale;
+   567	  c.width=img.naturalWidth*s;c.height=img.naturalHeight*s;
+   568	  const ctx=c.getContext('2d');
+   569	  ctx.drawImage(img,0,0,c.width,c.height);
+   570	  ctx.font=`${Math.max(10,11*s)}px ui-monospace,Consolas,monospace`;
+   571	  d.lines.forEach(ln=>{
+   572	    if(!ln.box)return;
+   573	    const active=(hi!=null&&ln.index===hi)||(window.__sel!=null&&ln.index===window.__sel);
+   574	    const p=ln.box.map(([x,y])=>[x*s,y*s]);
+   575	    ctx.beginPath();ctx.moveTo(p[0][0],p[0][1]);
+   576	    for(let i=1;i<4;i++)ctx.lineTo(p[i][0],p[i][1]);
+   577	    ctx.closePath();
+   578	    if(active){ctx.fillStyle='rgba(138,109,59,.34)';ctx.fill();}
+   579	    ctx.lineWidth=Math.max(1,(active?3.2:1.3)*s);
+   580	    ctx.strokeStyle=active?'rgba(166,124,46,1)':'rgba(138,109,59,.30)';
+   581	    ctx.stroke();
+   582	    if(active){ctx.fillStyle='rgba(166,124,46,1)';
+   583	      ctx.fillText('#'+ln.index,p[0][0],Math.max(11*s,p[0][1]-4));}
+   584	  });
+   585	}
+   586	function pointBoxDist(px,py,box){
+   587	  let inside=false,minD=1e9;
+   588	  for(let i=0;i<4;i++){
+   589	    const [x1,y1]=box[i],[x2,y2]=box[(i+1)%4];
+   590	    const dx=x2-x1,dy=y2-y1;
+   591	    const t=Math.max(0,Math.min(1,((px-x1)*dx+(py-y1)*dy)/((dx*dx+dy*dy)||1e-9)));
+   592	    const dd=Math.hypot(px-(x1+t*dx),py-(y1+t*dy));
+   593	    if(dd<minD)minD=dd;
+   594	    if(((y1>py)!==(y2>py))&&px<(x2-x1)*(py-y1)/((y2-y1)||1e-9)+x1)inside=!inside;
+   595	  }
+   596	  return inside?0:minD;
+   597	}
+   598	const LINES_=$('lines');
+   599	LINES_.addEventListener('mouseover',e=>{const row=e.target.closest('.rowline');if(row)drawBoxes(+row.dataset.i);});
+   600	LINES_.addEventListener('mouseout',e=>{if(!e.relatedTarget||!e.relatedTarget.closest('.rowline'))drawBoxes(null);});
+   601	LINES_.addEventListener('click',e=>{
+   602	  const row=e.target.closest('.rowline');if(!row)return;
+   603	  const i=+row.dataset.i;
+   604	  window.__sel=(window.__sel===i)?null:i;
+   605	  LINES_.querySelectorAll('.rowline').forEach(r=>r.classList.toggle('sel',+r.dataset.i===window.__sel));
+   606	  drawBoxes(null);
+   607	});
+   608	$('canvas').addEventListener('click',e=>{
+   609	  const c=$('canvas');
+   610	  if(!window.__res||!window.__scale)return;
+   611	  const rc=c.getBoundingClientRect();
+   612	  const px=(e.clientX-rc.left)*(c.width/rc.width);
+   613	  const py=(e.clientY-rc.top)*(c.height/rc.height);
+   614	  let best=null,bd=1e9;
+   615	  window.__res.lines.forEach(ln=>{if(!ln.box)return;
+   616	    const dd=pointBoxDist(px,py,ln.box);if(dd<bd){bd=dd;best=ln.index;}});
+   617	  if(best==null||bd>30)return;
+   618	  const row=LINES_.querySelector(`.rowline[data-i="${best}"]`);
+   619	  if(row){window.__sel=(window.__sel===best)?null:best;
+   620	    LINES_.querySelectorAll('.rowline').forEach(r=>r.classList.toggle('sel',+r.dataset.i===window.__sel));
+   621	    drawBoxes(null);row.scrollIntoView({block:'nearest',behavior:'smooth'});}
+   622	});
+   623	
+   624	/* logs */
+   625	let logsTimer=null;
+   626	async function refreshLogs(){
+   627	  try{const d=await (await fetch('/logs')).json();
+   628	      $('logs').textContent=d.lines.join('\\n')||'—';
+   629	      $('logs').scrollTop=$('logs').scrollHeight;}catch(e){}
+   630	}
+   631	function setLive(on){if(logsTimer){clearInterval(logsTimer);logsTimer=null;}if(on)logsTimer=setInterval(refreshLogs,2000);}
+   632	$('livecheck').onchange=e=>setLive(e.target.checked);
+   633	$('clearview').onclick=()=>{$('logs').textContent='—';};
+   634	setLive(true);refreshLogs();
+   635	</script></body></html>"""
+   636	
+   637	
+   638	@app.get("/", response_class=HTMLResponse)
+   639	def ui():
+   640	    return UI_HTML
+   641	
+   642	
+   643	@app.get("/logs")
+   644	def recent_logs():
+   645	    return {"count": len(LOGS), "lines": list(LOGS)}
+   646	
+   647	
+   648	def warm_predict(model) -> bool:
+   649	    """Run a tiny predict to prove the device actually works."""
+   650	    img = np.full((64, 200, 3), 255, dtype=np.uint8)
+   651	    cv2.putText(img, "warmup", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+   652	    try:
+   653	        model.predict(img)
+   654	        return True
+   655	    except Exception as exc:
+   656	        log(f"prewarm predict failed: {exc}")
+   657	        return False
+   658	
+   659	
+   660	def init_model(dev):
+   661	    kwargs = dict(
+   662	        lang=state["lang"],
+   663	        device=dev,
+   664	        enable_mkldnn=state["enable_mkldnn"],
+   665	        use_doc_orientation_classify=False,
+   666	        use_doc_unwarping=False,
+   667	        use_textline_orientation=False,
+   668	    )
+   669	    # Optional explicit model overrides. When set, paddleocr auto-downloads
+   670	    # the named model on first start. Note: explicit names make lang ignored.
+   671	    if state.get("det_model"):
+   672	        kwargs["text_detection_model_name"] = state["det_model"]
+   673	    if state.get("rec_model"):
+   674	        kwargs["text_recognition_model_name"] = state["rec_model"]
+   675	    return PaddleOCR(**kwargs)
+   676	
+   677	
+   678	@app.on_event("startup")
+   679	def startup():
+   680	    if state["force_tier"] == "rapidocr":
+   681	        # test/ops mode: no paddle init at all; tier 2 spawns lazily on first request
+   682	        log("skipping paddle init: --force-tier rapidocr (tier 2 only)")
+   683	        state["warm"] = True
+   684	        return
+   685	    req = state["requested_device"]
+   686	    if state["force_tier"] == "paddle-cpu":
+   687	        candidates = ["cpu"]
+   688	    elif req == "auto":
+   689	        candidates = ["cpu"]
+   690	        if paddle.device.is_compiled_with_cuda():
+   691	            try:
+   692	                if paddle.device.cuda.device_count() > 0:
+   693	                    candidates = ["gpu:0", "cpu"]
+   694	            except Exception:
+   695	                pass
+   696	    else:
+   697	        candidates = [resolve_device(req)]
+   698	
+   699	    for i, dev in enumerate(candidates):
+   700	        try:
+   701	            model = init_model(dev)
+   702	            if not warm_predict(model):
+   703	                raise RuntimeError("prewarm predict failed")
+   704	            state["model"] = model
+   705	            state["device"] = dev
+   706	            state["warm"] = True
+   707	            state["fallback_active"] = i > 0
+   708	            state["fallback_reason"] = (
+   709	                f"GPU on this host not usable ({state['first_error']}), using {dev}" if i > 0 else None
+   710	            )
+   711	            log(f"initialized device={dev} lang={state['lang']} det={state['det_model'] or 'default'} "
+   712	                f"rec={state['rec_model'] or 'default'} mkldnn={state['enable_mkldnn']} "
+   713	                f"fallback_active={state['fallback_active']}")
+   714	            return
+   715	        except SystemExit:
+   716	            raise
+   717	        except Exception as exc:
+   718	            state["error"] = f"{dev}: {exc}"
+   719	            if i == 0:
+   720	                state["first_error"] = str(exc)
+   721	            log(f"init on {dev} failed: {exc}")
+   722	    log("all device candidates failed")
+   723	
+   724	
+   725	@app.on_event("shutdown")
+   726	def shutdown():
+   727	    w = state["rapid_worker"]
+   728	    if w is not None:
+   729	        w.stop()
+   730	    log("service stopped")
+   731	
+   732	
+   733	if __name__ == "__main__":
+   734	    parser = argparse.ArgumentParser()
+   735	    parser.add_argument("--host", default="0.0.0.0")
+   736	    parser.add_argument("--port", type=int, default=8649)
+   737	    parser.add_argument("--device", default="auto",
+   738	                        help="auto = GPU first, automatic CPU fallback (init-time and runtime) | cpu | gpu | gpu:N")
+   739	    parser.add_argument("--lang", default="ch", help="ch (zh+en) | en | ja | ...")
+   740	    parser.add_argument("--det-model", default=None,
+   741	                        help="text_detection_model_name override (e.g. PP-OCRv6_server_det or a newer release). "
+   742	                             "Downloaded automatically on first start; empty = package default.")
+   743	    parser.add_argument("--rec-model", default=None,
+   744	                        help="text_recognition_model_name override (e.g. PP-OCRv6_server_rec). "
+   745	                             "Downloaded automatically on first start; empty = package default.")
+   746	    parser.add_argument("--mkldnn", action="store_true",
+   747	                        help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+   748	                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+   749	                             "not support' inside predict.")
+   750	    parser.add_argument("--no-rapid", action="store_true",
+   751	                        help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
+   752	    parser.add_argument("--rapid-worker", default=None,
+   753	                        help="python.exe of the RapidOCR venv for tier 2. "
+   754	                             "Default: <service dir>\\.venv-rapid\\Scripts\\python.exe. "
+   755	                             "If the path does not exist, tier 2 is disabled with a /health note.")
+   756	    parser.add_argument("--rapid-worker-script", default=None,
+   757	                        help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
+   758	    parser.add_argument("--conf-gate", type=float, default=0.70,
+   759	                        help="tier-2 min line confidence; any line below triggers a tier-3 "
+   760	                             "paddle CPU re-run. Default 0.70.")
+   761	    parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
+   762	                        help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
+   763	    args = parser.parse_args()
+   764	    state["requested_device"] = args.device
+   765	    state["lang"] = args.lang
+   766	    state["det_model"] = args.det_model
+   767	    state["rec_model"] = args.rec_model
+   768	    state["enable_mkldnn"] = bool(args.mkldnn)
+   769	    state["force_tier"] = args.force_tier
+   770	    state["conf_gate"] = args.conf_gate
+   771	
+   772	    service_dir = os.path.dirname(os.path.abspath(__file__))
+   773	    rapid_py = args.rapid_worker or os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
+   774	    rapid_script = args.rapid_worker_script or os.path.join(service_dir, "rapid_worker.py")
+   775	    state["rapid_worker_py"] = rapid_py
+   776	    state["rapid_worker_script"] = rapid_script
+   777	    if args.no_rapid:
+   778	        log("tier 2 disabled by --no-rapid")
+   779	    elif not os.path.exists(rapid_py):
+   780	        log(f"tier 2 disabled: rapid worker python not found at {rapid_py}")
+   781	    elif not os.path.exists(rapid_script):
+   782	        log(f"tier 2 disabled: rapid worker script not found at {rapid_script}")
+   783	    else:
+   784	        state["rapid_worker"] = RapidWorker(rapid_py, rapid_script)
+   785	        log(f"tier 2 enabled: {rapid_py} conf_gate={args.conf_gate}")
+   786	
+   787	    import uvicorn
+   788	
+
+exec
+/bin/bash -lc 'nl -ba rapid_worker.py' in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+     1	# Tier-2 OCR worker for paddle-ocr-service. Runs RapidOCR PP-OCRv6 medium (onnxruntime).
+     2	# Protocol: prints "READY" when loaded; reads one JSON line {"image": "<b64>"} per request;
+     3	# replies one line "OCR {json}". Any other stdout line is ignored by the parent.
+     4	import base64
+     5	import json
+     6	import sys
+     7	import time
+     8	
+     9	import cv2
+    10	import numpy as np
+    11	from rapidocr import RapidOCR, ModelType
+    12	
+    13	ocr = RapidOCR(params={"Det.model_type": ModelType.MEDIUM, "Rec.model_type": ModelType.MEDIUM})
+    14	print("READY", flush=True)
+    15	
+    16	
+    17	def boxes_of(r, n):
+    18	    b = getattr(r, "boxes", None)
+    19	    if b is None:
+    20	        b = getattr(r, "dt_polys", None)
+    21	    out = []
+    22	    if b is not None:
+    23	        for arr in list(b)[:n]:
+    24	            try:
+    25	                out.append([[float(x), float(y)] for x, y in list(arr)])
+    26	            except Exception:
+    27	                out.append(None)
+    28	    while len(out) < n:
+    29	        out.append(None)
+    30	    return out
+    31	
+    32	
+    33	for line in sys.stdin:
+    34	    line = line.strip()
+    35	    if not line:
+    36	        continue
+    37	    try:
+    38	        req = json.loads(line)
+    39	        img = cv2.imdecode(
+    40	            np.frombuffer(base64.b64decode(req["image"]), dtype=np.uint8), cv2.IMREAD_COLOR
+    41	        )
+    42	        if img is None:
+    43	            raise ValueError("cannot decode image bytes")
+    44	        t0 = time.time()
+    45	        r = ocr(img)
+    46	        elapsed = time.time() - t0
+    47	        texts = list(r.txts) if getattr(r, "txts", None) else []
+    48	        scores = [round(float(s), 4) for s in r.scores] if getattr(r, "scores", None) else []
+    49	        boxes = boxes_of(r, len(texts))
+    50	        lines = [
+    51	            {"index": i, "text": str(t), "confidence": scores[i] if i < len(scores) else None, "box": boxes[i]}
+    52	            for i, t in enumerate(texts)
+    53	        ]
+    54	        resp = {"ok": True, "lines": lines, "text": "\n".join(texts), "elapsed_s": round(elapsed, 3)}
+    55	    except Exception as exc:  # request-level failure; stay alive for the next line
+    56	        resp = {"ok": False, "error": str(exc)}
+    57	    print("OCR " + json.dumps(resp, ensure_ascii=False), flush=True)
+
+codex
+I found two paths that need closer checks: explicit `--device gpu` now enters the fallback chain, and child I/O appears able to wait without a deadline. I’m checking the original behavior and the worker protocol before assigning severity.
+exec
+/bin/bash -lc "nl -ba paddle_service_candidate.py | sed -n '675,788p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+exec
+/bin/bash -lc "nl -ba paddle_service_original.py | sed -n '440,570p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+exec
+/bin/bash -lc "nl -ba paddle_service_candidate.py | sed -n '165,420p'" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+   675	    return PaddleOCR(**kwargs)
+   676	
+   677	
+   678	@app.on_event("startup")
+   679	def startup():
+   680	    if state["force_tier"] == "rapidocr":
+   681	        # test/ops mode: no paddle init at all; tier 2 spawns lazily on first request
+   682	        log("skipping paddle init: --force-tier rapidocr (tier 2 only)")
+   683	        state["warm"] = True
+   684	        return
+   685	    req = state["requested_device"]
+   686	    if state["force_tier"] == "paddle-cpu":
+   687	        candidates = ["cpu"]
+   688	    elif req == "auto":
+   689	        candidates = ["cpu"]
+   690	        if paddle.device.is_compiled_with_cuda():
+   691	            try:
+   692	                if paddle.device.cuda.device_count() > 0:
+   693	                    candidates = ["gpu:0", "cpu"]
+   694	            except Exception:
+   695	                pass
+   696	    else:
+   697	        candidates = [resolve_device(req)]
+   698	
+   699	    for i, dev in enumerate(candidates):
+   700	        try:
+   701	            model = init_model(dev)
+   702	            if not warm_predict(model):
+   703	                raise RuntimeError("prewarm predict failed")
+   704	            state["model"] = model
+   705	            state["device"] = dev
+   706	            state["warm"] = True
+   707	            state["fallback_active"] = i > 0
+   708	            state["fallback_reason"] = (
+   709	                f"GPU on this host not usable ({state['first_error']}), using {dev}" if i > 0 else None
+   710	            )
+   711	            log(f"initialized device={dev} lang={state['lang']} det={state['det_model'] or 'default'} "
+   712	                f"rec={state['rec_model'] or 'default'} mkldnn={state['enable_mkldnn']} "
+   713	                f"fallback_active={state['fallback_active']}")
+   714	            return
+   715	        except SystemExit:
+   716	            raise
+   717	        except Exception as exc:
+   718	            state["error"] = f"{dev}: {exc}"
+   719	            if i == 0:
+   720	                state["first_error"] = str(exc)
+   721	            log(f"init on {dev} failed: {exc}")
+   722	    log("all device candidates failed")
+   723	
+   724	
+   725	@app.on_event("shutdown")
+   726	def shutdown():
+   727	    w = state["rapid_worker"]
+   728	    if w is not None:
+   729	        w.stop()
+   730	    log("service stopped")
+   731	
+   732	
+   733	if __name__ == "__main__":
+   734	    parser = argparse.ArgumentParser()
+   735	    parser.add_argument("--host", default="0.0.0.0")
+   736	    parser.add_argument("--port", type=int, default=8649)
+   737	    parser.add_argument("--device", default="auto",
+   738	                        help="auto = GPU first, automatic CPU fallback (init-time and runtime) | cpu | gpu | gpu:N")
+   739	    parser.add_argument("--lang", default="ch", help="ch (zh+en) | en | ja | ...")
+   740	    parser.add_argument("--det-model", default=None,
+   741	                        help="text_detection_model_name override (e.g. PP-OCRv6_server_det or a newer release). "
+   742	                             "Downloaded automatically on first start; empty = package default.")
+   743	    parser.add_argument("--rec-model", default=None,
+   744	                        help="text_recognition_model_name override (e.g. PP-OCRv6_server_rec). "
+   745	                             "Downloaded automatically on first start; empty = package default.")
+   746	    parser.add_argument("--mkldnn", action="store_true",
+   747	                        help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+   748	                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+   749	                             "not support' inside predict.")
+   750	    parser.add_argument("--no-rapid", action="store_true",
+   751	                        help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
+   752	    parser.add_argument("--rapid-worker", default=None,
+   753	                        help="python.exe of the RapidOCR venv for tier 2. "
+   754	                             "Default: <service dir>\\.venv-rapid\\Scripts\\python.exe. "
+   755	                             "If the path does not exist, tier 2 is disabled with a /health note.")
+   756	    parser.add_argument("--rapid-worker-script", default=None,
+   757	                        help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
+   758	    parser.add_argument("--conf-gate", type=float, default=0.70,
+   759	                        help="tier-2 min line confidence; any line below triggers a tier-3 "
+   760	                             "paddle CPU re-run. Default 0.70.")
+   761	    parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
+   762	                        help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
+   763	    args = parser.parse_args()
+   764	    state["requested_device"] = args.device
+   765	    state["lang"] = args.lang
+   766	    state["det_model"] = args.det_model
+   767	    state["rec_model"] = args.rec_model
+   768	    state["enable_mkldnn"] = bool(args.mkldnn)
+   769	    state["force_tier"] = args.force_tier
+   770	    state["conf_gate"] = args.conf_gate
+   771	
+   772	    service_dir = os.path.dirname(os.path.abspath(__file__))
+   773	    rapid_py = args.rapid_worker or os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
+   774	    rapid_script = args.rapid_worker_script or os.path.join(service_dir, "rapid_worker.py")
+   775	    state["rapid_worker_py"] = rapid_py
+   776	    state["rapid_worker_script"] = rapid_script
+   777	    if args.no_rapid:
+   778	        log("tier 2 disabled by --no-rapid")
+   779	    elif not os.path.exists(rapid_py):
+   780	        log(f"tier 2 disabled: rapid worker python not found at {rapid_py}")
+   781	    elif not os.path.exists(rapid_script):
+   782	        log(f"tier 2 disabled: rapid worker script not found at {rapid_script}")
+   783	    else:
+   784	        state["rapid_worker"] = RapidWorker(rapid_py, rapid_script)
+   785	        log(f"tier 2 enabled: {rapid_py} conf_gate={args.conf_gate}")
+   786	
+   787	    import uvicorn
+   788	
+
+ succeeded in 0ms:
+   440	    return {"count": len(LOGS), "lines": list(LOGS)}
+   441	
+   442	
+   443	def warm_predict(model) -> bool:
+   444	    """Run a tiny predict to prove the device actually works."""
+   445	    img = np.full((64, 200, 3), 255, dtype=np.uint8)
+   446	    cv2.putText(img, "warmup", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+   447	    try:
+   448	        model.predict(img)
+   449	        return True
+   450	    except Exception as exc:
+   451	        log(f"prewarm predict failed: {exc}")
+   452	        return False
+   453	
+   454	
+   455	def init_model(dev):
+   456	    kwargs = dict(
+   457	        lang=state["lang"],
+   458	        device=dev,
+   459	        enable_mkldnn=state["enable_mkldnn"],
+   460	        use_doc_orientation_classify=False,
+   461	        use_doc_unwarping=False,
+   462	        use_textline_orientation=False,
+   463	    )
+   464	    # Optional explicit model overrides. When set, paddleocr auto-downloads
+   465	    # the named model on first start. Note: explicit names make lang ignored.
+   466	    if state.get("det_model"):
+   467	        kwargs["text_detection_model_name"] = state["det_model"]
+   468	    if state.get("rec_model"):
+   469	        kwargs["text_recognition_model_name"] = state["rec_model"]
+   470	    return PaddleOCR(**kwargs)
+   471	
+   472	
+   473	def ensure_predict(img):
+   474	    """Predict, falling back to CPU once if a GPU run dies (init-time or runtime)."""
+   475	    if state["model"] is None:
+   476	        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   477	    try:
+   478	        return state["model"].predict(img)
+   479	    except Exception as exc:
+   480	        gpu_broken = state["device"] != "cpu" and state["requested_device"] == "auto"
+   481	        if not gpu_broken:
+   482	            raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)}) from exc
+   483	        log(f"GPU predict failed ({exc}); falling back to CPU")
+   484	        try:
+   485	            model = init_model("cpu")
+   486	            if not warm_predict(model):
+   487	                raise RuntimeError("CPU prewarm failed too")
+   488	            state["model"] = model
+   489	            state["device"] = "cpu"
+   490	            state["fallback_active"] = True
+   491	            state["fallback_reason"] = f"GPU runtime failure: {exc}"
+   492	            return model.predict(img)
+   493	        except Exception as exc2:
+   494	            raise HTTPException(
+   495	                status_code=500,
+   496	                detail={"error": "predict failed on GPU and CPU fallback", "detail": str(exc2)},
+   497	            ) from exc2
+   498	
+   499	
+   500	@app.on_event("startup")
+   501	def startup():
+   502	    req = state["requested_device"]
+   503	    if req == "auto":
+   504	        candidates = ["cpu"]
+   505	        if paddle.device.is_compiled_with_cuda():
+   506	            try:
+   507	                if paddle.device.cuda.device_count() > 0:
+   508	                    candidates = ["gpu:0", "cpu"]
+   509	            except Exception:
+   510	                pass
+   511	    else:
+   512	        candidates = [resolve_device(req)]
+   513	
+   514	    for i, dev in enumerate(candidates):
+   515	        try:
+   516	            model = init_model(dev)
+   517	            if not warm_predict(model):
+   518	                raise RuntimeError("prewarm predict failed")
+   519	            state["model"] = model
+   520	            state["device"] = dev
+   521	            state["warm"] = True
+   522	            state["fallback_active"] = i > 0
+   523	            state["fallback_reason"] = (
+   524	                f"GPU on this host not usable ({state['first_error']}), using {dev}" if i > 0 else None
+   525	            )
+   526	            log(f"initialized device={dev} lang={state['lang']} det={state['det_model'] or 'default'} "
+   527	                f"rec={state['rec_model'] or 'default'} mkldnn={state['enable_mkldnn']} "
+   528	                f"fallback_active={state['fallback_active']}")
+   529	            return
+   530	        except SystemExit:
+   531	            raise
+   532	        except Exception as exc:
+   533	            state["error"] = f"{dev}: {exc}"
+   534	            if i == 0:
+   535	                state["first_error"] = str(exc)
+   536	            log(f"init on {dev} failed: {exc}")
+   537	    log("all device candidates failed")
+   538	
+   539	
+   540	@app.on_event("shutdown")
+   541	def shutdown():
+   542	    log("service stopped")
+   543	
+   544	
+   545	if __name__ == "__main__":
+   546	    parser = argparse.ArgumentParser()
+   547	    parser.add_argument("--host", default="0.0.0.0")
+   548	    parser.add_argument("--port", type=int, default=8649)
+   549	    parser.add_argument("--device", default="auto",
+   550	                        help="auto = GPU first, automatic CPU fallback (init-time and runtime) | cpu | gpu | gpu:N")
+   551	    parser.add_argument("--lang", default="ch", help="ch (zh+en) | en | ja | ...")
+   552	    parser.add_argument("--det-model", default=None,
+   553	                        help="text_detection_model_name override (e.g. PP-OCRv6_server_det or a newer release). "
+   554	                             "Downloaded automatically on first start; empty = package default.")
+   555	    parser.add_argument("--rec-model", default=None,
+   556	                        help="text_recognition_model_name override (e.g. PP-OCRv6_server_rec). "
+   557	                             "Downloaded automatically on first start; empty = package default.")
+   558	    parser.add_argument("--mkldnn", action="store_true",
+   559	                        help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+   560	                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+   561	                             "not support' inside predict.")
+   562	    args = parser.parse_args()
+   563	    state["requested_device"] = args.device
+   564	    state["lang"] = args.lang
+   565	    state["det_model"] = args.det_model
+   566	    state["rec_model"] = args.rec_model
+   567	    state["enable_mkldnn"] = bool(args.mkldnn)
+   568	
+   569	    import uvicorn
+   570	
+
+ succeeded in 0ms:
+   165	    try:
+   166	        fields, device_label = ensure_fields(img)
+   167	    except HTTPException:
+   168	        raise
+   169	    except Exception as exc:
+   170	        raise HTTPException(status_code=500, detail={"error": "predict failed", "detail": str(exc)})
+   171	    elapsed = time.time() - t0
+   172	    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={device_label}", console=False)
+   173	    return {
+   174	        "text": fields["text"],
+   175	        "lines": fields["lines"],
+   176	        "elapsed_s": round(elapsed, 3),
+   177	        "device": device_label,
+   178	    }
+   179	
+   180	
+   181	# --- tier 2: RapidOCR child process ----------------------------------------
+   182	
+   183	
+   184	class RapidWorker:
+   185	    """Persistent rapid_worker.py child process, line-JSON protocol.
+   186	
+   187	    Child prints 'READY' once its engine is loaded, then one 'OCR {json}' line
+   188	    per request. Any other stdout line is skipped as child-side noise.
+   189	    """
+   190	
+   191	    def __init__(self, python_exe: str, script_path: str):
+   192	        self.python_exe = python_exe
+   193	        self.script_path = script_path
+   194	        self.proc = None
+   195	
+   196	    def _spawn(self):
+   197	        self.proc = subprocess.Popen(
+   198	            [self.python_exe, self.script_path],
+   199	            stdin=subprocess.PIPE,
+   200	            stdout=subprocess.PIPE,
+   201	            text=True,
+   202	            encoding="utf-8",
+   203	            cwd=os.path.dirname(os.path.abspath(self.script_path)) or None,
+   204	        )
+   205	        line = self.proc.stdout.readline()
+   206	        if line.strip() != "READY":
+   207	            raise RuntimeError(f"rapid worker handshake failed: {line[:200]!r}")
+   208	        log("rapidocr tier spawned")
+   209	
+   210	    def call(self, img: np.ndarray) -> dict | None:
+   211	        """Run OCR on a decoded BGR array. Returns fields dict or None on failure."""
+   212	        ok, buf = cv2.imencode(".png", img)
+   213	        if not ok:
+   214	            return None
+   215	        payload = json.dumps({"image": base64.b64encode(buf.tobytes()).decode("ascii")})
+   216	        for attempt in (1, 2):  # one respawn allowed within a single request
+   217	            try:
+   218	                if self.proc is None or self.proc.poll() is not None:
+   219	                    self.proc = None
+   220	                    self._spawn()
+   221	                self.proc.stdin.write(payload + "\n")
+   222	                self.proc.stdin.flush()
+   223	                while True:
+   224	                    line = self.proc.stdout.readline()
+   225	                    if not line:  # child died
+   226	                        raise RuntimeError("rapid worker stdout closed")
+   227	                    if line.startswith("OCR "):
+   228	                        resp = json.loads(line[4:])
+   229	                        if resp.get("ok"):
+   230	                            return {"lines": resp["lines"], "text": resp["text"]}
+   231	                        raise RuntimeError(f"rapid worker error: {resp.get('error')}")
+   232	                    # skip noise lines
+   233	                return None
+   234	            except Exception as exc:
+   235	                state["rapid"]["failures"] += 1
+   236	                log(f"rapidocr tier attempt {attempt} failed: {exc}")
+   237	                try:
+   238	                    if self.proc is not None:
+   239	                        self.proc.kill()
+   240	                except Exception:
+   241	                    pass
+   242	                self.proc = None
+   243	        return None
+   244	
+   245	    def stop(self):
+   246	        try:
+   247	            if self.proc is not None:
+   248	                self.proc.kill()
+   249	        except Exception:
+   250	            pass
+   251	        self.proc = None
+   252	
+   253	
+   254	def rapid_fields(img: np.ndarray) -> tuple[dict | None, str]:
+   255	    """Tier 2 attempt. Returns (fields, 'rapidocr-cpu') or (None, reason)."""
+   256	    w = state["rapid_worker"]
+   257	    if w is None:
+   258	        return None, "tier2 disabled"
+   259	    state["rapid"]["uses"] += 1
+   260	    fields = w.call(img)
+   261	    if fields is None:
+   262	        return None, "tier2 call failed"
+   263	    confs = [ln["confidence"] for ln in fields["lines"] if ln.get("confidence") is not None]
+   264	    min_conf = min(confs) if confs else 0.0
+   265	    if min_conf < state["conf_gate"]:
+   266	        state["rapid"]["gated"] += 1
+   267	        log(f"tier2 min_conf {min_conf:.3f} < gate {state['conf_gate']}; re-running on paddle CPU")
+   268	        return None, f"tier2 conf gate (min_conf {min_conf:.3f})"
+   269	    return fields, "rapidocr-cpu"
+   270	
+   271	
+   272	def tier3_fields(img: np.ndarray, reason: str) -> tuple[dict, str]:
+   273	    """Tier 3: paddle CPU (existing standby path, lazily initialized)."""
+   274	    if state["device"] == "cpu" and state["model"] is not None:
+   275	        res = state["model"].predict(img)
+   276	        return result_fields(res[0]), "cpu"
+   277	    if state["model"] is None or state["device"] != "cpu":
+   278	        log(f"initializing paddle CPU tier 3 ({reason})")
+   279	        model = init_model("cpu")
+   280	        if not warm_predict(model):
+   281	            raise HTTPException(status_code=500, detail={"error": "predict failed: paddle CPU fallback prewarm failed"})
+   282	        state["model"] = model
+   283	        state["device"] = "cpu"
+   284	        state["fallback_active"] = True
+   285	        state["fallback_reason"] = reason
+   286	    state["fallback_active"] = True
+   287	    if not state["fallback_reason"]:
+   288	        state["fallback_reason"] = reason
+   289	    res = state["model"].predict(img)
+   290	    return result_fields(res[0]), "cpu"
+   291	
+   292	
+   293	def ensure_fields(img: np.ndarray) -> tuple[dict, str]:
+   294	    """Engine chain. Returns (fields, device_label). Raises HTTPException only if everything fails."""
+   295	    ft = state["force_tier"]
+   296	    if ft == "rapidocr":
+   297	        fields, why = rapid_fields(img)
+   298	        if fields is not None:
+   299	            return fields, why
+   300	        return tier3_fields(img, f"tier2 unavailable ({why})")
+   301	    if ft == "paddle-cpu":
+   302	        return tier3_fields(img, "forced paddle-cpu")
+   303	    if ft == "gpu":
+   304	        if state["model"] is None:
+   305	            raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   306	        res = state["model"].predict(img)
+   307	        return result_fields(res[0]), state["device"]
+   308	    if state["model"] is None:
+   309	        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+   310	    if state["device"] == "cpu":
+   311	        # booted on CPU by request: chain ends here (paddle CPU is the last tier)
+   312	        res = state["model"].predict(img)
+   313	        return result_fields(res[0]), "cpu"
+   314	    # tier 1: paddle GPU. Per-request retry keeps auto-recovery: a transient
+   315	    # VRAM conflict repairs itself on the next request without a restart.
+   316	    try:
+   317	        res = state["model"].predict(img)
+   318	        return result_fields(res[0]), state["device"]
+   319	    except Exception as exc:
+   320	        state["gpu_runtime_failures"] += 1
+   321	        reason = f"GPU runtime failure ({state['gpu_runtime_failures']}): {exc}"
+   322	        state["fallback_reason"] = reason
+   323	        log(f"{reason}; descending engine chain")
+   324	        fields, why = rapid_fields(img)
+   325	        if fields is not None:
+   326	            return fields, "rapidocr-cpu"
+   327	        return tier3_fields(img, f"tier 2 unavailable ({why}); {reason}")
+   328	
+   329	
+   330	@app.get("/health")
+   331	def health():
+   332	    ready = state["model"] is not None or state["force_tier"] == "rapidocr"
+   333	    w = state["rapid_worker"]
+   334	    return {
+   335	        "status": "ok" if ready else "warming",
+   336	        "service": "paddle-ocr-service",
+   337	        "device": state["device"],
+   338	        "device_requested": state["requested_device"],
+   339	        "lang": state["lang"],
+   340	        "det_model": state["det_model"],
+   341	        "rec_model": state["rec_model"],
+   342	        "enable_mkldnn": state["enable_mkldnn"],
+   343	        "model_initialized": state["model"] is not None,
+   344	        "warm": state["warm"],
+   345	        "fallback_active": state["fallback_active"],
+   346	        "fallback_reason": state["fallback_reason"],
+   347	        "init_error": state["error"],
+   348	        "paddle_version": paddle.__version__,
+   349	        "paddleocr_version": paddleocr.__version__,
+   350	        "paddle_compiled_with_cuda": paddle.device.is_compiled_with_cuda(),
+   351	        "force_tier": state["force_tier"],
+   352	        "engine_chain": engine_chain(),
+   353	        "conf_gate": state["conf_gate"],
+   354	        "rapid_worker": {
+   355	            "enabled": w is not None,
+   356	            "python": state["rapid_worker_py"],
+   357	            "script": state["rapid_worker_script"],
+   358	            "spawned": bool(w and w.proc is not None and w.proc.poll() is None),
+   359	            **state["rapid"],
+   360	        },
+   361	        "gpu_runtime_failures": state["gpu_runtime_failures"],
+   362	    }
+   363	
+   364	
+   365	def engine_chain() -> list[str]:
+   366	    if state["force_tier"] == "rapidocr":
+   367	        tiers = ["rapidocr-cpu", "paddle-cpu"]
+   368	    elif state["force_tier"] == "paddle-cpu":
+   369	        tiers = ["paddle-cpu"]
+   370	    elif state["force_tier"] == "gpu":
+   371	        tiers = ["paddle-gpu"]
+   372	    elif state["rapid_worker"] is not None:
+   373	        tiers = ["paddle-gpu", "rapidocr-cpu", "paddle-cpu"]
+   374	    else:
+   375	        tiers = ["paddle-gpu", "paddle-cpu"]
+   376	    return tiers
+   377	
+   378	
+   379	def check_ready():
+   380	    if state["force_tier"] == "rapidocr":
+   381	        if state["rapid_worker"] is None:
+   382	            raise HTTPException(status_code=503, detail={"error": "rapidocr tier not configured (worker missing)"})
+   383	        return
+   384	    get_model()
+   385	
+   386	
+   387	@app.post("/ocr")
+   388	async def ocr_json(body: OcrJson):
+   389	    check_ready()
+   390	    img_bytes = decode_image_bytes(body.image_b64, body.mime)
+   391	    return _run_one(img_bytes, None)
+   392	
+   393	
+   394	def decode_image_bytes(raw_b64: str, mime: str | None) -> bytes:
+   395	    try:
+   396	        raw = base64.b64decode(raw_b64, validate=True)
+   397	    except (binascii.Error, ValueError):
+   398	        raise HTTPException(status_code=400, detail="image_b64 is not valid base64")
+   399	    return raw
+   400	
+   401	
+   402	@app.post("/ocr/upload")
+   403	async def ocr_upload(image: UploadFile = File(...)):
+   404	    check_ready()
+   405	    raw = await image.read()
+   406	    return _run_one(raw, image.filename)
+   407	
+   408	
+   409	# --- GUI + logs -----------------------------------------------------------
+   410	UI_HTML = """<!doctype html>
+   411	<html lang="en"><head><meta charset="utf-8">
+   412	<meta name="viewport" content="width=device-width,initial-scale=1">
+   413	<title>PaddleOCR service</title>
+   414	<style>
+   415	:root{--bg:#faf9f7;--panel:#fff;--ink:#1f1d1a;--muted:#6b675f;--line:#e6e2da;
+   416	--accent:#8a6d3b;--accent-soft:#f4efe6;--warn:#a1541c}
+   417	*{box-sizing:border-box}
+   418	body{margin:0;background:var(--bg);color:var(--ink);
+   419	font:15px/1.55 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
+   420	.wrap{max-width:980px;margin:0 auto;padding:36px 20px 64px}
+
+exec
+/bin/bash -lc "sed -n '1,430p' tier2.diff" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+--- paddle_service_original.py	2026-10-18 13:35:05.191359479 +0800
++++ paddle_service_candidate.py	2026-10-18 13:45:31.077343374 +0800
+@@ -1,13 +1,23 @@
+ """PaddleOCR service — FastAPI wrapper for the Windows PC.
+ 
+-Runs the paddleocr 3.x defaults (PP-OCRv6 det+rec). One script, one port:
+-GPU build -> serves fast OCR with automatic CPU fallback.
++Engine chain (all PP-OCRv6_medium det+rec):
++  1. paddle GPU  (paddlepaddle-gpu, ~0.05-0.34s/img)
++  2. RapidOCR cpu (onnxruntime, separate venv child process, ~1.5-2.2s/img;
++     lazy-spawned only after a GPU runtime failure)
++  3. paddle CPU  (mkldnn off, ~7-9.5s/img; also re-runs when tier 2 output
++     has any line below the tier-2 confidence gate)
+ 
+ Devices:
+-  --device auto  GPU first (build + driver + real prewarm predict), CPU fallback
+-  --device cpu   force CPU
+-  --device gpu   force GPU (gpu:0)
++  --device auto  GPU first (build + driver + real prewarm predict)
++  --device cpu   force paddle CPU (chain disabled)
++  --device gpu   force GPU, no fallback tiers
+   --device gpu:N pin a specific CUDA device
++Tier flags:
++  --no-rapid            disable tier 2 (GPU -> paddle CPU only)
++  --rapid-worker PATH   python.exe of the RapidOCR venv (tier 2)
++  --rapid-worker-script PATH  rapid_worker.py (tier 2 child protocol)
++  --conf-gate F         tier-2 min line confidence; below -> tier 3 re-run (default 0.70)
++  --force-tier T        test/ops override: auto|gpu|paddle-cpu|rapidocr
+ Models:
+   --det-model/--rec-model override packaged defaults (auto-downloaded; e.g. a newer release)
+ GUI:
+@@ -19,7 +29,10 @@
+ import base64
+ import binascii
+ import datetime as dt
++import json
+ import logging
++import os
++import subprocess
+ import time
+ from collections import deque
+ 
+@@ -47,6 +60,14 @@
+     "first_error": None,
+     "warm": False,
+     "error": None,
++    # engine chain (tier 2 = RapidOCR child process)
++    "force_tier": "auto",
++    "conf_gate": 0.70,
++    "rapid_worker": None,
++    "rapid_worker_py": None,
++    "rapid_worker_script": None,
++    "rapid": {"uses": 0, "failures": 0, "gated": 0},
++    "gpu_runtime_failures": 0,
+ }
+ 
+ # --- ring log -------------------------------------------------------------
+@@ -142,26 +163,176 @@
+         raise HTTPException(status_code=400, detail=f"cannot decode image (filename={filename!r})")
+     t0 = time.time()
+     try:
+-        results = ensure_predict(img)
++        fields, device_label = ensure_fields(img)
+     except HTTPException:
+         raise
+     except Exception as exc:
+-        raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)})
++        raise HTTPException(status_code=500, detail={"error": "predict failed", "detail": str(exc)})
+     elapsed = time.time() - t0
+-    fields = result_fields(results[0]) if results else {"lines": [], "text": ""}
+-    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={state['device']}", console=False)
++    log(f"ocr ok {filename or 'base64'} {elapsed:.2f}s {len(fields['lines'])} lines device={device_label}", console=False)
+     return {
+         "text": fields["text"],
+         "lines": fields["lines"],
+         "elapsed_s": round(elapsed, 3),
+-        "device": state["device"],
++        "device": device_label,
+     }
+ 
+ 
++# --- tier 2: RapidOCR child process ----------------------------------------
++
++
++class RapidWorker:
++    """Persistent rapid_worker.py child process, line-JSON protocol.
++
++    Child prints 'READY' once its engine is loaded, then one 'OCR {json}' line
++    per request. Any other stdout line is skipped as child-side noise.
++    """
++
++    def __init__(self, python_exe: str, script_path: str):
++        self.python_exe = python_exe
++        self.script_path = script_path
++        self.proc = None
++
++    def _spawn(self):
++        self.proc = subprocess.Popen(
++            [self.python_exe, self.script_path],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            text=True,
++            encoding="utf-8",
++            cwd=os.path.dirname(os.path.abspath(self.script_path)) or None,
++        )
++        line = self.proc.stdout.readline()
++        if line.strip() != "READY":
++            raise RuntimeError(f"rapid worker handshake failed: {line[:200]!r}")
++        log("rapidocr tier spawned")
++
++    def call(self, img: np.ndarray) -> dict | None:
++        """Run OCR on a decoded BGR array. Returns fields dict or None on failure."""
++        ok, buf = cv2.imencode(".png", img)
++        if not ok:
++            return None
++        payload = json.dumps({"image": base64.b64encode(buf.tobytes()).decode("ascii")})
++        for attempt in (1, 2):  # one respawn allowed within a single request
++            try:
++                if self.proc is None or self.proc.poll() is not None:
++                    self.proc = None
++                    self._spawn()
++                self.proc.stdin.write(payload + "\n")
++                self.proc.stdin.flush()
++                while True:
++                    line = self.proc.stdout.readline()
++                    if not line:  # child died
++                        raise RuntimeError("rapid worker stdout closed")
++                    if line.startswith("OCR "):
++                        resp = json.loads(line[4:])
++                        if resp.get("ok"):
++                            return {"lines": resp["lines"], "text": resp["text"]}
++                        raise RuntimeError(f"rapid worker error: {resp.get('error')}")
++                    # skip noise lines
++                return None
++            except Exception as exc:
++                state["rapid"]["failures"] += 1
++                log(f"rapidocr tier attempt {attempt} failed: {exc}")
++                try:
++                    if self.proc is not None:
++                        self.proc.kill()
++                except Exception:
++                    pass
++                self.proc = None
++        return None
++
++    def stop(self):
++        try:
++            if self.proc is not None:
++                self.proc.kill()
++        except Exception:
++            pass
++        self.proc = None
++
++
++def rapid_fields(img: np.ndarray) -> tuple[dict | None, str]:
++    """Tier 2 attempt. Returns (fields, 'rapidocr-cpu') or (None, reason)."""
++    w = state["rapid_worker"]
++    if w is None:
++        return None, "tier2 disabled"
++    state["rapid"]["uses"] += 1
++    fields = w.call(img)
++    if fields is None:
++        return None, "tier2 call failed"
++    confs = [ln["confidence"] for ln in fields["lines"] if ln.get("confidence") is not None]
++    min_conf = min(confs) if confs else 0.0
++    if min_conf < state["conf_gate"]:
++        state["rapid"]["gated"] += 1
++        log(f"tier2 min_conf {min_conf:.3f} < gate {state['conf_gate']}; re-running on paddle CPU")
++        return None, f"tier2 conf gate (min_conf {min_conf:.3f})"
++    return fields, "rapidocr-cpu"
++
++
++def tier3_fields(img: np.ndarray, reason: str) -> tuple[dict, str]:
++    """Tier 3: paddle CPU (existing standby path, lazily initialized)."""
++    if state["device"] == "cpu" and state["model"] is not None:
++        res = state["model"].predict(img)
++        return result_fields(res[0]), "cpu"
++    if state["model"] is None or state["device"] != "cpu":
++        log(f"initializing paddle CPU tier 3 ({reason})")
++        model = init_model("cpu")
++        if not warm_predict(model):
++            raise HTTPException(status_code=500, detail={"error": "predict failed: paddle CPU fallback prewarm failed"})
++        state["model"] = model
++        state["device"] = "cpu"
++        state["fallback_active"] = True
++        state["fallback_reason"] = reason
++    state["fallback_active"] = True
++    if not state["fallback_reason"]:
++        state["fallback_reason"] = reason
++    res = state["model"].predict(img)
++    return result_fields(res[0]), "cpu"
++
++
++def ensure_fields(img: np.ndarray) -> tuple[dict, str]:
++    """Engine chain. Returns (fields, device_label). Raises HTTPException only if everything fails."""
++    ft = state["force_tier"]
++    if ft == "rapidocr":
++        fields, why = rapid_fields(img)
++        if fields is not None:
++            return fields, why
++        return tier3_fields(img, f"tier2 unavailable ({why})")
++    if ft == "paddle-cpu":
++        return tier3_fields(img, "forced paddle-cpu")
++    if ft == "gpu":
++        if state["model"] is None:
++            raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
++        res = state["model"].predict(img)
++        return result_fields(res[0]), state["device"]
++    if state["model"] is None:
++        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
++    if state["device"] == "cpu":
++        # booted on CPU by request: chain ends here (paddle CPU is the last tier)
++        res = state["model"].predict(img)
++        return result_fields(res[0]), "cpu"
++    # tier 1: paddle GPU. Per-request retry keeps auto-recovery: a transient
++    # VRAM conflict repairs itself on the next request without a restart.
++    try:
++        res = state["model"].predict(img)
++        return result_fields(res[0]), state["device"]
++    except Exception as exc:
++        state["gpu_runtime_failures"] += 1
++        reason = f"GPU runtime failure ({state['gpu_runtime_failures']}): {exc}"
++        state["fallback_reason"] = reason
++        log(f"{reason}; descending engine chain")
++        fields, why = rapid_fields(img)
++        if fields is not None:
++            return fields, "rapidocr-cpu"
++        return tier3_fields(img, f"tier 2 unavailable ({why}); {reason}")
++
++
+ @app.get("/health")
+ def health():
++    ready = state["model"] is not None or state["force_tier"] == "rapidocr"
++    w = state["rapid_worker"]
+     return {
+-        "status": "ok" if state["model"] is not None else "warming",
++        "status": "ok" if ready else "warming",
+         "service": "paddle-ocr-service",
+         "device": state["device"],
+         "device_requested": state["requested_device"],
+@@ -177,12 +348,45 @@
+         "paddle_version": paddle.__version__,
+         "paddleocr_version": paddleocr.__version__,
+         "paddle_compiled_with_cuda": paddle.device.is_compiled_with_cuda(),
++        "force_tier": state["force_tier"],
++        "engine_chain": engine_chain(),
++        "conf_gate": state["conf_gate"],
++        "rapid_worker": {
++            "enabled": w is not None,
++            "python": state["rapid_worker_py"],
++            "script": state["rapid_worker_script"],
++            "spawned": bool(w and w.proc is not None and w.proc.poll() is None),
++            **state["rapid"],
++        },
++        "gpu_runtime_failures": state["gpu_runtime_failures"],
+     }
+ 
+ 
++def engine_chain() -> list[str]:
++    if state["force_tier"] == "rapidocr":
++        tiers = ["rapidocr-cpu", "paddle-cpu"]
++    elif state["force_tier"] == "paddle-cpu":
++        tiers = ["paddle-cpu"]
++    elif state["force_tier"] == "gpu":
++        tiers = ["paddle-gpu"]
++    elif state["rapid_worker"] is not None:
++        tiers = ["paddle-gpu", "rapidocr-cpu", "paddle-cpu"]
++    else:
++        tiers = ["paddle-gpu", "paddle-cpu"]
++    return tiers
++
++
++def check_ready():
++    if state["force_tier"] == "rapidocr":
++        if state["rapid_worker"] is None:
++            raise HTTPException(status_code=503, detail={"error": "rapidocr tier not configured (worker missing)"})
++        return
++    get_model()
++
++
+ @app.post("/ocr")
+ async def ocr_json(body: OcrJson):
+-    get_model()
++    check_ready()
+     img_bytes = decode_image_bytes(body.image_b64, body.mime)
+     return _run_one(img_bytes, None)
+ 
+@@ -197,10 +401,11 @@
+ 
+ @app.post("/ocr/upload")
+ async def ocr_upload(image: UploadFile = File(...)):
+-    get_model()
++    check_ready()
+     raw = await image.read()
+     return _run_one(raw, image.filename)
+ 
++
+ # --- GUI + logs -----------------------------------------------------------
+ UI_HTML = """<!doctype html>
+ <html lang="en"><head><meta charset="utf-8">
+@@ -470,37 +675,17 @@
+     return PaddleOCR(**kwargs)
+ 
+ 
+-def ensure_predict(img):
+-    """Predict, falling back to CPU once if a GPU run dies (init-time or runtime)."""
+-    if state["model"] is None:
+-        raise HTTPException(status_code=503, detail={"error": "model not initialized", "detail": state["error"]})
+-    try:
+-        return state["model"].predict(img)
+-    except Exception as exc:
+-        gpu_broken = state["device"] != "cpu" and state["requested_device"] == "auto"
+-        if not gpu_broken:
+-            raise HTTPException(status_code=500, detail={"error": "paddle predict failed", "detail": str(exc)}) from exc
+-        log(f"GPU predict failed ({exc}); falling back to CPU")
+-        try:
+-            model = init_model("cpu")
+-            if not warm_predict(model):
+-                raise RuntimeError("CPU prewarm failed too")
+-            state["model"] = model
+-            state["device"] = "cpu"
+-            state["fallback_active"] = True
+-            state["fallback_reason"] = f"GPU runtime failure: {exc}"
+-            return model.predict(img)
+-        except Exception as exc2:
+-            raise HTTPException(
+-                status_code=500,
+-                detail={"error": "predict failed on GPU and CPU fallback", "detail": str(exc2)},
+-            ) from exc2
+-
+-
+ @app.on_event("startup")
+ def startup():
++    if state["force_tier"] == "rapidocr":
++        # test/ops mode: no paddle init at all; tier 2 spawns lazily on first request
++        log("skipping paddle init: --force-tier rapidocr (tier 2 only)")
++        state["warm"] = True
++        return
+     req = state["requested_device"]
+-    if req == "auto":
++    if state["force_tier"] == "paddle-cpu":
++        candidates = ["cpu"]
++    elif req == "auto":
+         candidates = ["cpu"]
+         if paddle.device.is_compiled_with_cuda():
+             try:
+@@ -539,6 +724,9 @@
+ 
+ @app.on_event("shutdown")
+ def shutdown():
++    w = state["rapid_worker"]
++    if w is not None:
++        w.stop()
+     log("service stopped")
+ 
+ 
+@@ -559,12 +747,42 @@
+                         help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+                              "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+                              "not support' inside predict.")
++    parser.add_argument("--no-rapid", action="store_true",
++                        help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
++    parser.add_argument("--rapid-worker", default=None,
++                        help="python.exe of the RapidOCR venv for tier 2. "
++                             "Default: <service dir>\\.venv-rapid\\Scripts\\python.exe. "
++                             "If the path does not exist, tier 2 is disabled with a /health note.")
++    parser.add_argument("--rapid-worker-script", default=None,
++                        help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
++    parser.add_argument("--conf-gate", type=float, default=0.70,
++                        help="tier-2 min line confidence; any line below triggers a tier-3 "
++                             "paddle CPU re-run. Default 0.70.")
++    parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
++                        help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
+     args = parser.parse_args()
+     state["requested_device"] = args.device
+     state["lang"] = args.lang
+     state["det_model"] = args.det_model
+     state["rec_model"] = args.rec_model
+     state["enable_mkldnn"] = bool(args.mkldnn)
++    state["force_tier"] = args.force_tier
++    state["conf_gate"] = args.conf_gate
++
++    service_dir = os.path.dirname(os.path.abspath(__file__))
++    rapid_py = args.rapid_worker or os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
++    rapid_script = args.rapid_worker_script or os.path.join(service_dir, "rapid_worker.py")
++    state["rapid_worker_py"] = rapid_py
++    state["rapid_worker_script"] = rapid_script
++    if args.no_rapid:
++        log("tier 2 disabled by --no-rapid")
++    elif not os.path.exists(rapid_py):
++        log(f"tier 2 disabled: rapid worker python not found at {rapid_py}")
++    elif not os.path.exists(rapid_script):
++        log(f"tier 2 disabled: rapid worker script not found at {rapid_script}")
++    else:
++        state["rapid_worker"] = RapidWorker(rapid_py, rapid_script)
++        log(f"tier 2 enabled: {rapid_py} conf_gate={args.conf_gate}")
+ 
+     import uvicorn
+ 
+
+exec
+/bin/bash -lc 'tail -n 12 paddle_service_original.py paddle_service_candidate.py && rg -n "uvicorn.run|app.run|__main__|venv-rapid|timeout|conf_gate|fallback_active" paddle_service_candidate.py rapid_worker.py BRIEF.md' in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+==> paddle_service_original.py <==
+                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+                             "not support' inside predict.")
+    args = parser.parse_args()
+    state["requested_device"] = args.device
+    state["lang"] = args.lang
+    state["det_model"] = args.det_model
+    state["rec_model"] = args.rec_model
+    state["enable_mkldnn"] = bool(args.mkldnn)
+
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+==> paddle_service_candidate.py <==
+        log("tier 2 disabled by --no-rapid")
+    elif not os.path.exists(rapid_py):
+        log(f"tier 2 disabled: rapid worker python not found at {rapid_py}")
+    elif not os.path.exists(rapid_script):
+        log(f"tier 2 disabled: rapid worker script not found at {rapid_script}")
+    else:
+        state["rapid_worker"] = RapidWorker(rapid_py, rapid_script)
+        log(f"tier 2 enabled: {rapid_py} conf_gate={args.conf_gate}")
+
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")BRIEF.md:64:- The worker has no per-call timeout: a hung child blocks the request until
+BRIEF.md:66:  120 s urlopen timeout.
+paddle_service_candidate.py:58:    "fallback_active": False,
+paddle_service_candidate.py:65:    "conf_gate": 0.70,
+paddle_service_candidate.py:265:    if min_conf < state["conf_gate"]:
+paddle_service_candidate.py:267:        log(f"tier2 min_conf {min_conf:.3f} < gate {state['conf_gate']}; re-running on paddle CPU")
+paddle_service_candidate.py:284:        state["fallback_active"] = True
+paddle_service_candidate.py:286:    state["fallback_active"] = True
+paddle_service_candidate.py:345:        "fallback_active": state["fallback_active"],
+paddle_service_candidate.py:353:        "conf_gate": state["conf_gate"],
+paddle_service_candidate.py:480:<tr><th>GET /health</th><td>JSON: status, device, versions, fallback_active, fallback_reason</td></tr>
+paddle_service_candidate.py:503:  const chips=[['status',d.status],['device',d.device+(d.fallback_active?' · fallback':'')],
+paddle_service_candidate.py:508:    `<span class="chip ${d.fallback_active&&k==='device'?'warn':''}">${k}: <b>${v}</b></span>`).join('');
+paddle_service_candidate.py:707:            state["fallback_active"] = i > 0
+paddle_service_candidate.py:713:                f"fallback_active={state['fallback_active']}")
+paddle_service_candidate.py:733:if __name__ == "__main__":
+paddle_service_candidate.py:754:                             "Default: <service dir>\\.venv-rapid\\Scripts\\python.exe. "
+paddle_service_candidate.py:770:    state["conf_gate"] = args.conf_gate
+paddle_service_candidate.py:773:    rapid_py = args.rapid_worker or os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
+paddle_service_candidate.py:785:        log(f"tier 2 enabled: {rapid_py} conf_gate={args.conf_gate}")
+paddle_service_candidate.py:789:    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+exec
+/bin/bash -lc "python -B - <<'PY'
+import ast
+from pathlib import Path
+src = Path('paddle_service_candidate.py').read_text()
+tree = ast.parse(src)
+fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'ensure_fields')
+ns = {'state': {'force_tier':'auto','requested_device':'gpu','model':None,'device':'gpu:0','gpu_runtime_failures':0,'fallback_reason':None},
+      'HTTPException':Exception, 'log':lambda *a, **k:None,
+      'rapid_fields':lambda img: ({'lines':[], 'text':'rapid'}, 'rapidocr-cpu'),
+      'tier3_fields':lambda img,reason: ({'lines':[], 'text':'cpu'}, 'cpu'),
+      'result_fields':lambda res: {'lines':[], 'text':'paddle'}}
+class Fails:
+    def predict(self,img): raise RuntimeError('GPU failure')
+ns['state']['model']=Fails()
+exec(compile(ast.Module(body=[fn],type_ignores=[]),'<candidate>','exec'),ns)
+print('explicit_gpu_failure:', ns['ensure_fields'](object()), 'rapid_calls_inferred=1')
+ns['state'].update(requested_device='auto', model=type('Empty',(),{'predict':lambda self,img: []})(), gpu_runtime_failures=0)
+try:
+    print('empty_predict:',ns['ensure_fields'](object()))
+except Exception as e:
+    print('empty_predict_exception:',type(e).__name__,str(e))
+PY" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 7ms:
+explicit_gpu_failure: ({'lines': [], 'text': 'rapid'}, 'rapidocr-cpu') rapid_calls_inferred=1
+empty_predict: ({'lines': [], 'text': 'rapid'}, 'rapidocr-cpu')
+
+exec
+/bin/bash -lc "python -B - <<'PY'
+import ast
+from pathlib import Path
+src=Path('paddle_service_candidate.py').read_text()
+tree=ast.parse(src)
+fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='ensure_fields')
+class Empty:
+ def predict(self,img): return []
+ns={'state':{'force_tier':'auto','requested_device':'cpu','model':Empty(),'device':'cpu','error':None},'HTTPException':Exception,'result_fields':lambda x:x}
+exec(compile(ast.Module(body=[fn],type_ignores=[]),'<candidate>','exec'),ns)
+try: print(ns['ensure_fields'](object()))
+except Exception as e: print('cpu_empty_predict_exception:',type(e).__name__,str(e))
+PY" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+cpu_empty_predict_exception: IndexError list index out of range
+
+exec
+/bin/bash -lc "python -B - <<'PY'
+import ast
+from pathlib import Path
+t=ast.parse(Path('paddle_service_candidate.py').read_text())
+f=next(n for n in t.body if isinstance(n,ast.FunctionDef) and n.name=='rapid_fields')
+class Worker:
+ def call(self,img): return {'lines':[{'text':'high','confidence':0.99},{'text':'unknown','confidence':None}], 'text':'high\\nunknown'}
+s={'state':{'rapid_worker':Worker(),'rapid':{'uses':0,'gated':0},'conf_gate':0.70},'log':lambda *a,**k:None}
+exec(compile(ast.Module(body=[f],type_ignores=[]),'<candidate>','exec'),s)
+print('mixed_missing_confidence:',s['rapid_fields'](object())[1], 'gated=',s['state']['rapid']['gated'])
+PY" in /root/.hermes/cache/scratch/rapidocr-trial/review
+ succeeded in 0ms:
+mixed_missing_confidence: rapidocr-cpu gated= 0
+
+codex
+REVISE
+
+- **High — A hung worker can stall the service indefinitely.** The READY handshake and OCR response both use blocking `readline()` with no deadline ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:205), [candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:224)). A client’s 120-second timeout does not stop that server-side wait or trigger tier 3. Add a bounded deadline that kills the child and falls back to paddle CPU.
+- **High — `--device gpu` no longer means GPU only.** With the default `--force-tier auto`, any GPU prediction error enters RapidOCR and then CPU ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:314)). The original returned an error for explicit `gpu` or `gpu:N` ([original](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_original.py:480)). A read-only mock probe confirmed the candidate returns `rapidocr-cpu` for an explicit GPU request.
+- **Medium — Tier 2 is skipped when GPU fails during startup.** Startup selects and stores the CPU model after a failed GPU prewarm; subsequent requests take the direct CPU branch ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:688), [candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:310)). That leaves this GPU failure mode at the original slow CPU path.
+- **Medium — Empty paddle results now fail or cause unnecessary fallback.** The original returned empty `lines` and `text` for an empty result list ([original](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_original.py:151)). The candidate indexes `res[0]` unconditionally ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:313)); a read-only mock probe produced `IndexError` on CPU.
+- **Medium — A line with missing confidence can pass the gate.** The worker explicitly emits `None` when a score is missing ([worker](/root/.hermes/cache/scratch/rapidocr-trial/review/rapid_worker.py:51)), while the gate ignores that line if another line has a high score ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:263)). A mock probe confirmed such a response is accepted. Treat missing confidence as a reason to use tier 3.
+
+The GPU retry is bounded within each request, though a persistent failure is retried on every request. The observed scores support keeping the configurable 0.70 gate for now; the 0.7159 receipt line leaves a narrow margin and merits a calibration comment.
+tokens used
+48,821
+REVISE
+
+- **High — A hung worker can stall the service indefinitely.** The READY handshake and OCR response both use blocking `readline()` with no deadline ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:205), [candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:224)). A client’s 120-second timeout does not stop that server-side wait or trigger tier 3. Add a bounded deadline that kills the child and falls back to paddle CPU.
+- **High — `--device gpu` no longer means GPU only.** With the default `--force-tier auto`, any GPU prediction error enters RapidOCR and then CPU ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:314)). The original returned an error for explicit `gpu` or `gpu:N` ([original](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_original.py:480)). A read-only mock probe confirmed the candidate returns `rapidocr-cpu` for an explicit GPU request.
+- **Medium — Tier 2 is skipped when GPU fails during startup.** Startup selects and stores the CPU model after a failed GPU prewarm; subsequent requests take the direct CPU branch ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:688), [candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:310)). That leaves this GPU failure mode at the original slow CPU path.
+- **Medium — Empty paddle results now fail or cause unnecessary fallback.** The original returned empty `lines` and `text` for an empty result list ([original](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_original.py:151)). The candidate indexes `res[0]` unconditionally ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:313)); a read-only mock probe produced `IndexError` on CPU.
+- **Medium — A line with missing confidence can pass the gate.** The worker explicitly emits `None` when a score is missing ([worker](/root/.hermes/cache/scratch/rapidocr-trial/review/rapid_worker.py:51)), while the gate ignores that line if another line has a high score ([candidate](/root/.hermes/cache/scratch/rapidocr-trial/review/paddle_service_candidate.py:263)). A mock probe confirmed such a response is accepted. Treat missing confidence as a reason to use tier 3.
+
+The GPU retry is bounded within each request, though a persistent failure is retried on every request. The observed scores support keeping the configurable 0.70 gate for now; the 0.7159 receipt line leaves a narrow margin and merits a calibration comment.

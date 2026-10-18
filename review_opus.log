@@ -1,0 +1,48 @@
+**Verdict: REVISE**
+
+The basic design is sound: a separate venv, a line-JSON child process, a confidence gate, and a lazy tier 3. The response shape is unchanged; the only additions are the `rapidocr-cpu`/`cpu` device labels, and `/health` only gains new keys. But two defects break the brief's constraints, and one undoes the main benefit of the change. Your live tests didn't catch them because they ran with `--force-tier rapidocr`, which goes through a different branch of `ensure_fields` than a normal boot. This was a read-only review: I traced the code by hand and ran nothing. I didn't modify any files.
+
+## Must fix
+
+**1. `--device gpu` / `gpu:N` now fall back to other tiers.** (`paddle_service_candidate.py:308-327`)
+- **Original:** on a predict failure, `gpu_broken` required `requested_device == "auto"`. A forced GPU therefore returned HTTP 500.
+- **Candidate:** only checks `force_tier`. With `--device gpu` and the default `--force-tier auto`, a failure drops to the `except` branch and goes to RapidOCR, then paddle CPU.
+- **Result:** this breaks "`--device gpu` semantics unchanged" and contradicts the docstring ("force GPU, no fallback tiers").
+- **Fix:** add `state["requested_device"] == "auto"` to the condition before descending; otherwise re-raise as 500.
+
+**2. One gated request permanently strands the service on the slowest tier.** (`tier3_fields` at `:277-285`, then the branch at `:310`)
+- `tier3_fields` replaces `state["model"]` with a CPU model and sets `state["device"] = "cpu"`.
+- Every later request in auto mode then takes the "booted on CPU by request" branch at `:310`. It never retries the GPU and never uses RapidOCR again.
+- So the first gated request during a GPU outage (an EN line with digits, or any blank image, since zero lines counts as gated) switches the service for good to 7–9.5 s/img. That is exactly the original's behaviour, so the "auto-recovery" and the 1.5–2.2 s tier are both lost.
+- **Fix:** keep the tier-3 CPU model in its own slot (e.g. `state["cpu_model"]`) and never overwrite the GPU model or `state["device"]` from the runtime path. Then the per-request GPU retry and tier 2 stay in effect.
+
+**3. A hung child freezes the whole service, not just one request.** (`:205`, `:224`)
+- `/ocr` and `/ocr/upload` are `async def` but call blocking code directly, so requests run one at a time on the event loop. The original does the same, so this part isn't new.
+- A child stuck at `stdout.readline()` (in `call` or in the `_spawn` handshake) therefore blocks `/health`, `/logs`, the GUI and every queued request, with no end.
+- The VM's 120 s timeout only frees the client. The server stays stuck until someone restarts it, and it never reaches tier 3.
+- **Result:** this breaks the brief's "timed-out child must degrade to tier 3" requirement. A RapidOCR model auto-download at first spawn on a host without network is one plausible way to hit it. **Severity: high impact, low likelihood.**
+- **Fix:** read the child's stdout on a reader thread into a `queue.Queue`, with `get(timeout=…)` around 20–30 s for OCR and longer for the handshake; on timeout, kill the child and treat it as a failure. Windows can't `select()` on pipes, so a thread is the practical option.
+
+## Should fix
+
+4. **Windows pipe encoding.** (`rapid_worker.py:57`) The worker prints `ensure_ascii=False`. On Windows, a piped child's stdout uses the locale codepage (cp1252 or cp936), not UTF-8, unless `PYTHONUTF8`/`PYTHONIOENCODING` is set. Possible results: `UnicodeEncodeError` crashes the child (the `print` sits outside the `try`), or GBK bytes fail to decode as UTF-8 in the parent, or you get mojibake. Your ZH test passing suggests the test shell had UTF-8 mode on, which may not hold under the production launcher. Removing `ensure_ascii=False` is the simplest fix; passing `env={**os.environ, "PYTHONIOENCODING": "utf-8"}` to `Popen` also works.
+
+5. **A per-image error kills a healthy child.** (`:231`) A worker reply of `{"ok": false}` (e.g. one image fails to decode) raises inside the retry loop. That kills the child, respawns it (paying the model load again), fails again the same way, and kills it again. It should return `None` without killing the child.
+
+6. **No circuit breaker when spawning keeps failing.** If the rapid venv is broken, every request during a GPU outage pays two Python+onnxruntime startups (a few seconds) before tier 3. Disabling tier 2 after N consecutive spawn failures, or applying a cooldown, would fix this.
+
+7. **Startup handshake doesn't skip noise.** (`:205`) `_spawn` requires the very first stdout line to be `READY`, unlike the noise-skipping loop in `call`. Any library output on stdout at import breaks the handshake. Loop until `READY`, under the timeout from #3.
+
+## Judgment on your known deltas
+
+- **Per-request GPU retry:** there is no runaway loop: each request makes one GPU attempt, then falls through. Two caveats: it only works once #2 is fixed, and a persistent CUDA error adds that failure's cost to every request. `fallback_reason` is never cleared when the GPU recovers, and `fallback_active` stays false while tier 2 is serving, so `/health` misreports both cases.
+- **Zero lines gated:** reasonable, provided #2 is fixed so a gated request only costs latency. With #2 unfixed, a single blank page during an outage triggers the permanent CPU switch.
+- **Gate 0.70 vs "GST 9%" at 0.7159:** keep 0.70. Corrupted lines were observed at 0.61–0.64 and the receipt line at 0.716, so 0.70 sits between them, with about 0.06 of margin on the corruption side, which is the one that matters. A false gate only costs about 8 s and still returns correct text. Put both data points in a code comment. Also note that the gate takes the minimum over all lines, so long receipts will be gated more often.
+- **No per-call timeout:** more serious than "blocks the request until the HTTP client times out". See #3: it freezes the entire service until a restart.
+
+## Minor
+- When the GPU fails at boot and auto mode lands on CPU, tier 2 is never used, yet `engine_chain` still reports `paddle-gpu → rapidocr-cpu → paddle-cpu`. This is arguably the most common degraded state; consider routing it through tier 2.
+- `/health` reports `status: ok` under `--force-tier rapidocr` even when the worker is missing and every request would return 503.
+- The 500 detail text changed from "paddle predict failed" to "predict failed". Check whether any client matches on that string.
+- `rapid.failures` counts attempts, not requests (up to 2 per request). Document it or count per request.
+- There is no boot-time probe of the worker, so a broken rapid venv only shows up during a GPU outage. An optional spawn-and-handshake at startup that reports to `/health` would surface it early.
