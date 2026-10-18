@@ -3,10 +3,16 @@
 A single-file FastAPI wrapper around [PaddleOCR 3.x](https://github.com/PaddlePaddle/PaddleOCR)
 that turns a machine with a GPU (or CPU only) into a LAN OCR service.
 
-- **One script, one port.** `paddle_service.py` does everything: HTTP API, browser GUI, logs.
+- **One service, one port.** `paddle_service.py` does everything: HTTP API, browser GUI, logs.
 - **CPU and GPU builds.** `--device auto` probes the host: paddle CUDA build → driver-visible GPU →
   a real prewarm inference. Any failure (no GPU, old driver, too little VRAM, incompatible
   runtime) falls back to CPU automatically, and `/health` reports the exact reason.
+- **Tiered engine chain with a confidence gate.** `/health` reports the chain
+  `[paddle-gpu, rapidocr-cpu, paddle-cpu]`: tier 1 is GPU paddle; on a GPU runtime
+  failure tier 2 is a rapidocr CPU child process (its own `.venv-rapid`, ONNX Runtime);
+  if any tier-2 returned line lands under the confidence gate (`--conf-gate`, default
+  0.70 — a MISSING confidence also gates) the request is re-run on tier 3 paddle CPU
+  for accuracy. The GPU model and its per-request retry and recovery stay untouched.
 - **Box coordinates.** Every detected line returns its text, confidence, and the 4-point
   polygon in source-image pixels — usable for receipts, invoices, and coordinate extraction.
 - **Built-in GUI** at `/`: drag-and-drop upload, canvas preview with box overlay,
@@ -66,7 +72,7 @@ uv pip install --python .venv-gpu/Scripts/python.exe -r req.txt
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | status, device, versions, `fallback_active`, `fallback_reason` |
+| `GET /health` | status, device, versions, `fallback_active`, `fallback_reason`, `engine_chain`, `conf_gate`, `rapid_worker` counters |
 | `POST /ocr` | JSON body `{"image_b64": "...", "mime": "image/png"}` |
 | `POST /ocr/upload` | multipart file upload |
 | `GET /` | browser GUI |
@@ -107,9 +113,16 @@ receipt-style layouts all read back exact, ZH confidence ~0.9999.
   at paddleocr 3.7.0); they download automatically to `~/.paddlex` on first start.
 - GUI boxes render from the returned polygons, which handles skewed/rotated text.
 - If a GPU predict dies at runtime (e.g. VRAM got taken), the request retries once
-  on CPU instead of failing.
+  on CPU instead of failing; the tier-2 rapidocr child spawns on demand for the
+  next attempt, with one 80 s call budget and a transport-only circuit breaker.
 - After VRAM frees up on a host that fell back to CPU at startup, restart the
   service to return to GPU.
+- Tier-2 setup: create `.venv-rapid` beside the script with `rapidocr` (ONNX,
+  medium det+rec) + `onnxruntime` + opencv-headless, and put `rapid_worker.py`
+  in the same directory. Missing either disables tier 2 with a startup log ("tier
+  2 disabled"); `--no-rapid` skips it, `--force-tier` overrides the chain for
+  testing. The review record (BRIEF, per-round reviewer logs, FIXES) is in this
+  repository; LAN locations are documented as `<PC-LAN>`.
 
 ## License
 
