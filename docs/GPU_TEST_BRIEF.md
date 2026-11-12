@@ -6,7 +6,7 @@ CPU, returns the same text, and degrades cleanly when the GPU is unavailable.
 
 ## 0. Prereqs
 - NVIDIA GPU with a working driver (`nvidia-smi` must work).
-- Python 3.12 venv with the GPU stack. Follow "GPU host (CUDA 12.x)" in `README.md`
+- Python 3.12 venv (`uv venv .venv-gpu --python 3.12`; other Python versions may lack wheels) with the GPU stack. Follow "GPU host (CUDA 12.x)" in `README.md`
   (`paddlepaddle-gpu==3.3.1` from the cu126 index, `paddleocr==3.7.0`, `fastapi`, `uvicorn[standard]`,
   `python-multipart`, matching cuDNN).
 - Skip tier 2 unless asked: always pass `--no-rapid`.
@@ -51,7 +51,7 @@ python ocr_cli.py gpu_test.png --format text
 | 1 | `/health` | `status: ok`, `device: gpu:0`, `fallback_active: false`, `paddle_compiled_with_cuda: true`, `engine_chain` starts with `paddle-gpu` |
 | 2 | OCR result | `device: gpu:0`; the three lines read back correctly; every line has 4-point `box` and `confidence` above 0.9 |
 | 3 | Speed | warm `elapsed_s` under 0.5 s (README measured about 0.05 s on a 4070 Ti) |
-| 4 | GPU is really used | `nvidia-smi` shows the python process holding about 1 GiB VRAM while the service is up |
+| 4 | GPU is really used | total `memory.used` in `nvidia-smi` rises by roughly 0.5-1 GiB once the service is up (on Windows/WDDM per-process VRAM shows `[N/A]`, so compare totals before and after) |
 | 5 | Logs | `GET /logs` shows `initialized device=gpu:0 ... fallback_active=False` and no errors |
 
 ## 4. Compare against CPU
@@ -60,14 +60,14 @@ Stop the service, then:
 python paddle_service.py --port 8649 --device cpu --no-rapid
 python ocr_cli.py gpu_test.png          # note device, elapsed_s, text
 ```
-Pass: `device: cpu`, same text as the GPU run, GPU at least 10x faster (README: 80-100x).
+Pass: `device: cpu`, same text as the GPU run, GPU at least 10x faster (typically 40x or more).
 
 ## 5. Degradation (each: start service, run `ocr_cli.py gpu_test.png`, record `/health`)
 | Scenario | Command | Expected |
 |---|---|---|
-| No GPU visible | `CUDA_VISIBLE_DEVICES=-1 python paddle_service.py --device auto --no-rapid` (PowerShell: `$env:CUDA_VISIBLE_DEVICES=-1`) | boots on `cpu`, OCR still works, no crash |
-| Explicit GPU, bad index | `python paddle_service.py --device gpu:99 --no-rapid` | no GPU fallback; `/ocr` returns 503 with a clear error; process stays up |
-| Bad flag | `--conf-gate 2` | exits immediately with a clear message |
+| No GPU visible | `CUDA_VISIBLE_DEVICES=-1 python paddle_service.py --device auto --no-rapid` (PowerShell: `$env:CUDA_VISIBLE_DEVICES=-1`) | boots on `cpu`, OCR still works, no crash; `/health` `engine_chain` has no `paddle-gpu` |
+| Explicit GPU, bad index | `python paddle_service.py --device gpu:99 --no-rapid` | no GPU fallback; `/health` status `error` with `init_error` set; `/ocr` returns 503; process stays up |
+| Bad flag | `--conf-gate 2` | exits within a second with `argument --conf-gate: ... must be in (0, 1]` (exit code 2) |
 
 Optional (only if easy): while the service runs on `--device auto`, fill VRAM from another process
 and call `/ocr`. Expect either a normal GPU result or a CPU result with `fallback_active: true` and a

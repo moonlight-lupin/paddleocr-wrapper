@@ -45,6 +45,9 @@ GPU (~0.085 s warm) is **~40x** faster than CPU (~3.4 s). Passes the brief's 10x
 Not run: the optional "fill VRAM from another process" test. On a display-attached WDDM GPU it risks freezing the desktop and other apps.
 
 ## Observations and proposed changes
+
+> **Follow-up applied:** items 1, 2 and 6 are fixed in code (with tests), items 3, 4, 5 and 7 in the README and brief. The text below is the original report.
+
 None of these block the GPU path. Listed by value; **all are proposals, not applied.**
 
 1. **`engine_chain` in `/health` is static, not actual.** `engine_chain()` (`paddle_service.py`, ~L537) builds the list from `force_tier` and `rapid_worker` only. With `--device cpu` or `CUDA_VISIBLE_DEVICES=-1` it still reports `["paddle-gpu", "paddle-cpu"]`, which suggests a GPU tier exists when none is active.
