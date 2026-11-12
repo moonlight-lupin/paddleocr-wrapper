@@ -88,9 +88,21 @@ hardware, but transitive packages (numpy, opencv, paddlex's tree, ...) still flo
 everything, generate a hashed lock **on the target host** (wheels are platform-specific) and commit it:
 
 ```bash
-uv pip compile requirements-gpu.txt --generate-hashes -o requirements-gpu.lock   # or requirements.txt / requirements-rapid.txt
-uv pip install --require-hashes -r requirements-gpu.lock
+uv pip compile requirements-gpu.txt --python-version 3.12 --index-strategy unsafe-best-match \
+    --emit-index-url --generate-hashes -o requirements-gpu.lock
+uv pip install --require-hashes --index-strategy unsafe-best-match -r requirements-gpu.lock
 ```
+
+Both flags are needed with the GPU file (tested with uv 0.11.17): Paddle's index also lists names
+such as `paddleocr` and `numpy`, and uv's default `first-index` strategy then refuses to look at PyPI
+for them. `--emit-index-url` writes both index URLs into the lock so the install line can find
+`paddlepaddle-gpu`. `unsafe-best-match` relaxes uv's dependency-confusion guard, but every artefact is
+still pinned by version and sha256, so a different build cannot be substituted.
+
+Install the lock into a **fresh** venv. Syncing it over an environment that already has
+`opencv-python-headless` removes that package's files from the shared `cv2/` folder and leaves
+`cv2` broken (`no attribute 'imencode'`). The committed `requirements-gpu.lock` was generated for
+Windows / CPython 3.12 (`--python-platform windows`); regenerate it on Linux.
 
 Regenerate deliberately when upgrading, then re-run `pytest` and the GPU brief.
 
