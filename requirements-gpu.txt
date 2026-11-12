@@ -1,0 +1,8 @@
+# GPU host (CUDA 12.x driver). paddlepaddle-gpu 3.x is NOT on PyPI (PyPI stops at 2.6.2);
+# it is served only from Paddle's own index below. The exact pin means PyPI can never
+# supply a different build under that name; add --require-hashes via a lock file for
+# integrity (README "Reproducible installs").
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+-r requirements-base.txt
+paddlepaddle-gpu==3.3.1
+nvidia-cudnn-cu12==9.5.1.17

@@ -27,7 +27,7 @@ that turns a machine with a GPU (or CPU only) into a LAN OCR service.
 
 ```bash
 uv venv .venv --python 3.12
-uv pip install --python .venv/Scripts/python.exe paddlepaddle paddleocr fastapi "uvicorn[standard]" python-multipart
+uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 .venv\Scripts\python.exe paddle_service.py --port 8649 --device auto
 ```
 
@@ -38,17 +38,29 @@ uv pip install --python .venv/Scripts/python.exe paddlepaddle paddleocr fastapi 
 
 ### GPU host (CUDA 12.x)
 
-GPU wheels are published on paddle's own index, not PyPI:
-
 ```bash
 uv venv .venv-gpu --python 3.12
-uv pip install --python .venv-gpu/Scripts/python.exe \
-    --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
-    paddlepaddle-gpu==3.3.1
-uv pip install --python .venv-gpu/Scripts/python.exe \
-    paddleocr==3.7.0 fastapi "uvicorn[standard]" python-multipart
+uv pip install --python .venv-gpu/Scripts/python.exe -r requirements-gpu.txt
 .venv-gpu/Scripts/python.exe paddle_service.py --port 8649 --device auto
 ```
+
+#### Where the GPU wheel comes from
+
+`paddlepaddle-gpu` 3.x is **not on PyPI** (PyPI stops at 2.6.2), and Hugging Face does not host
+Python wheels. The only official source is Paddle's own index
+(`https://www.paddlepaddle.org.cn/packages/stable/cu126/`), which `requirements-gpu.txt` adds as an
+*extra* index. Everything else installs from PyPI. Mitigations, strongest last:
+
+- The exact pin (`==3.3.1`) means PyPI can never supply a different build under that name.
+- Generate a hashed lock (below) so every artefact, including the Paddle wheel, is hash-verified.
+- For a locked-down host: download the wheel once on a trusted machine, check its hash, and install
+  from your own folder or internal index (`uv pip install --no-index --find-links wheelhouse/ ...`).
+- If you must avoid Paddle's server entirely, the alternative is the ONNX route: RapidOCR (tier 2)
+  with `onnxruntime-gpu`, both on PyPI. It is not wired up for GPU in this repo today (tier 2 runs on CPU).
+
+**Models** are separate from the wheel. Since paddleocr 3.0.2 they download from Hugging Face by
+default (Baidu BOS only if `PADDLE_PDX_MODEL_SOURCE` is set to BOS), into `~/.paddlex`. To avoid
+network access at runtime, copy a populated `~/.paddlex` to the target host.
 
 The cu126 wheel bundles the CUDA runtime and cuDNN as pip dependencies
 (`nvidia-*-cu12`) — no NVIDIA toolkit install needed. The 3.3.1 wheel targets cuDNN 9.9,
@@ -68,6 +80,19 @@ uv pip install --python .venv-gpu/Scripts/python.exe -r req.txt
 ```
 
 > Note: older `uv` releases (<=0.11.17) have no `--no-install-package` flag.
+
+### Reproducible installs
+
+The `requirements*.txt` files pin the *direct* dependencies to the versions verified on real
+hardware, but transitive packages (numpy, opencv, paddlex's tree, ...) still float. To freeze
+everything, generate a hashed lock **on the target host** (wheels are platform-specific) and commit it:
+
+```bash
+uv pip compile requirements-gpu.txt --generate-hashes -o requirements-gpu.lock   # or requirements.txt / requirements-rapid.txt
+uv pip install --require-hashes -r requirements-gpu.lock
+```
+
+Regenerate deliberately when upgrading, then re-run `pytest` and the GPU brief.
 
 ## API
 
@@ -112,6 +137,19 @@ python ocr_cli.py --health                     # service status JSON
 
 Results go to stdout, diagnostics to stderr. A failed image is `{"file": ..., "error": ...}`.
 Exit codes: `0` all OK, `1` at least one image failed, `2` service unreachable.
+
+## Request limits
+
+Requests are bounded so one huge upload cannot tie up or crash the service. Over a limit the
+service answers **413** with a JSON `detail.error`:
+
+| Flag | Default | Guards |
+|---|---|---|
+| `--max-upload-mb` | 20 | request body size, checked from `Content-Length` and while streaming (chunked bodies too). Base64 JSON bodies carry ~33% overhead over the raw image |
+| `--max-pixels` | 40,000,000 | width x height read from the PNG/JPEG header before decoding (decompression bombs: a tiny file that expands to gigabytes) |
+
+The pixel check covers PNG and JPEG; other formats (WebP, BMP, ...) are only size-limited. OCR runs
+one image at a time (`CHAIN_LOCK`), so concurrent large requests queue rather than multiply memory.
 
 ## Measured performance (RTX 4070 Ti, PP-OCRv6 medium, 2026-10)
 

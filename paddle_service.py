@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import queue
+import struct
 import subprocess
 import sys
 import threading
@@ -51,6 +52,18 @@ def _conf_gate(text: str) -> float:
     if not (0 < value <= 1):
         raise argparse.ArgumentTypeError(f"--conf-gate must be in (0, 1], got {value}")
     return value
+
+
+def _positive(kind):
+    def parse(text: str):
+        try:
+            value = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"must be a positive number, got {text!r}")
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"must be > 0, got {value}")
+        return value
+    return parse
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conf-gate", type=_conf_gate, default=0.70,
                         help="tier-2 min line confidence; any line below triggers a tier-3 "
                              "paddle CPU re-run. Default 0.70.")
+    parser.add_argument("--max-upload-mb", type=_positive(float), default=20,
+                        help="max request body size in MiB (413 above it). Base64 JSON bodies carry ~33%% "
+                             "overhead over the raw image. Default 20.")
+    parser.add_argument("--max-pixels", type=_positive(int), default=40_000_000,
+                        help="max image width*height (413 above it; guards decompression bombs). "
+                             "Checked from the PNG/JPEG header before decoding. Default 40,000,000.")
     parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
                         help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
     return parser
@@ -93,7 +112,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import paddle
@@ -134,7 +153,76 @@ state = {
     "rapid": {"uses": 0, "failures": 0, "gated": 0, "failure_requests": 0, "circuit_open": False},
     "gpu_runtime_failures": 0,
     "cpu_model": None,
+    # request limits (--max-upload-mb / --max-pixels)
+    "max_upload_bytes": 20 * 1024 * 1024,
+    "max_pixels": 40_000_000,
 }
+
+class BodyLimitMiddleware:
+    """Reject oversize POST bodies with 413: up front via Content-Length, and while
+    streaming for chunked bodies that declare none. The over-limit signal is an
+    HTTPException so FastAPI's body parsing re-raises it instead of turning it into a 400."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in ("POST", "PUT", "PATCH"):
+            return await self.app(scope, receive, send)
+        limit = state["max_upload_bytes"]
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > limit:
+            return await _too_large(limit)(scope, receive, send)
+        seen = 0
+
+        async def counting_receive():
+            nonlocal seen
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body", b""))
+                if seen > limit:
+                    raise HTTPException(status_code=413, detail=_too_large_detail(limit))
+            return msg
+
+        await self.app(scope, counting_receive, send)
+
+
+def _too_large_detail(limit: int) -> dict:
+    return {"error": f"request body exceeds the {limit / 1048576:g} MiB limit (--max-upload-mb)"}
+
+
+def _too_large(limit: int):
+    return JSONResponse({"detail": _too_large_detail(limit)}, status_code=413)
+
+
+app.add_middleware(BodyLimitMiddleware)
+
+
+def image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """(width, height) from a PNG or JPEG header without decoding; None if unknown/other format."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 4 <= len(data):
+            if data[i] != 0xFF:
+                break
+            marker = data[i + 1]
+            if marker == 0xFF:               # fill byte
+                i += 1
+            elif marker == 0x01 or 0xD0 <= marker <= 0xD8:   # standalone markers, no length
+                i += 2
+            elif marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                if i + 9 > len(data):
+                    break
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            elif marker == 0xDA:             # start of scan before any frame header
+                break
+            else:
+                i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+    return None
+
 
 # Serializes engine-chain predict + tier-2 child IPC across request handlers.
 # The original also served effectively one predict at a time (sync predict in
@@ -236,6 +324,13 @@ def result_fields(res) -> dict:
 
 def _run_one(image_bytes: bytes, filename: str | None) -> dict:
     """Shared handler body for both /ocr and /ocr/upload."""
+    if len(image_bytes) > state["max_upload_bytes"]:
+        raise HTTPException(status_code=413, detail=_too_large_detail(state["max_upload_bytes"]))
+    dims = image_dimensions(image_bytes)
+    if dims and dims[0] * dims[1] > state["max_pixels"]:
+        raise HTTPException(status_code=413, detail={
+            "error": f"image is {dims[0]}x{dims[1]} = {dims[0] * dims[1]:,} pixels, over the "
+                     f"{state['max_pixels']:,} pixel limit (--max-pixels)"})
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
@@ -976,6 +1071,8 @@ if __name__ == "__main__":
     state["enable_mkldnn"] = bool(args.mkldnn)
     state["force_tier"] = args.force_tier
     state["conf_gate"] = args.conf_gate
+    state["max_upload_bytes"] = int(args.max_upload_mb * 1024 * 1024)
+    state["max_pixels"] = args.max_pixels
 
     service_dir = os.path.dirname(os.path.abspath(__file__))
     rapid_py = args.rapid_worker or default_rapid_python(service_dir)

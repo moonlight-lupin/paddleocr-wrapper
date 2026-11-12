@@ -38,6 +38,8 @@ def _request(req: urllib.request.Request, timeout: float):
             detail = json.loads(exc.read()).get("detail", exc.reason)
         except Exception:
             detail = exc.reason
+        if isinstance(detail, dict):   # service errors look like {"error": ..., "detail": ...}
+            detail = detail.get("error") or json.dumps(detail)
         return exc.code, {"error": detail if isinstance(detail, str) else json.dumps(detail)}
     except (urllib.error.URLError, OSError) as exc:
         raise Unreachable(str(getattr(exc, "reason", exc))) from exc
