@@ -43,6 +43,52 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 
+def _conf_gate(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--conf-gate must be a number in (0, 1], got {text!r}")
+    if not (0 < value <= 1):
+        raise argparse.ArgumentTypeError(f"--conf-gate must be in (0, 1], got {value}")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="PaddleOCR FastAPI service (see module docstring).")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8649)
+    parser.add_argument("--device", default="auto",
+                        help="auto = GPU first, automatic CPU fallback (init-time and runtime) | cpu | gpu | gpu:N")
+    parser.add_argument("--lang", default="ch", help="ch (zh+en) | en | ja | ...")
+    parser.add_argument("--det-model", default=None,
+                        help="text_detection_model_name override (e.g. PP-OCRv6_server_det or a newer release). "
+                             "Downloaded automatically on first start; empty = package default.")
+    parser.add_argument("--rec-model", default=None,
+                        help="text_recognition_model_name override (e.g. PP-OCRv6_server_rec). "
+                             "Downloaded automatically on first start; empty = package default.")
+    parser.add_argument("--mkldnn", action="store_true",
+                        help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
+                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
+                             "not support' inside predict.")
+    parser.add_argument("--no-rapid", action="store_true",
+                        help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
+    parser.add_argument("--rapid-worker", default=None,
+                        help="python.exe of the RapidOCR venv for tier 2. "
+                             "Default: <service dir>/.venv-rapid (Scripts/python.exe on Windows, bin/python elsewhere). "
+                             "If the path does not exist, tier 2 is disabled with a /health note.")
+    parser.add_argument("--rapid-worker-script", default=None,
+                        help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
+    parser.add_argument("--conf-gate", type=_conf_gate, default=0.70,
+                        help="tier-2 min line confidence; any line below triggers a tier-3 "
+                             "paddle CPU re-run. Default 0.70.")
+    parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
+                        help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
+    return parser
+
+
+# Parse CLI flags BEFORE the multi-second paddle import so a bad flag (or --help) fails fast.
+ARGS = build_parser().parse_args() if __name__ == "__main__" else None
+
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -504,7 +550,7 @@ def health():
         state["force_tier"] == "rapidocr" and w is not None
     )
     return {
-        "status": "ok" if ready else "warming",
+        "status": "ok" if ready else ("error" if state["error"] else "warming"),
         "service": "paddle-ocr-service",
         "device": state["device"],
         "device_requested": state["requested_device"],
@@ -534,17 +580,26 @@ def health():
     }
 
 
+def gpu_tier_listed() -> bool:
+    """True when a paddle GPU tier is (or, before init, may be) in play."""
+    dev = state["device"]
+    if dev == "uninitialized":
+        return state["requested_device"] != "cpu"
+    return dev.startswith("gpu")
+
+
 def engine_chain() -> list[str]:
-    if state["force_tier"] == "rapidocr":
-        tiers = ["rapidocr-cpu", "paddle-cpu"]
-    elif state["force_tier"] == "paddle-cpu":
-        tiers = ["paddle-cpu"]
-    elif state["force_tier"] == "gpu":
-        tiers = ["paddle-gpu"]
-    elif state["rapid_worker"] is not None:
-        tiers = ["paddle-gpu", "rapidocr-cpu", "paddle-cpu"]
-    else:
-        tiers = ["paddle-gpu", "paddle-cpu"]
+    ft = state["force_tier"]
+    if ft == "rapidocr":
+        return ["rapidocr-cpu", "paddle-cpu"]
+    if ft == "paddle-cpu":
+        return ["paddle-cpu"]
+    if ft == "gpu":
+        return ["paddle-gpu"]
+    tiers = ["paddle-gpu"] if gpu_tier_listed() else []
+    if state["rapid_worker"] is not None:
+        tiers.append("rapidocr-cpu")
+    tiers.append("paddle-cpu")
     return tiers
 
 
@@ -913,36 +968,7 @@ def shutdown():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8649)
-    parser.add_argument("--device", default="auto",
-                        help="auto = GPU first, automatic CPU fallback (init-time and runtime) | cpu | gpu | gpu:N")
-    parser.add_argument("--lang", default="ch", help="ch (zh+en) | en | ja | ...")
-    parser.add_argument("--det-model", default=None,
-                        help="text_detection_model_name override (e.g. PP-OCRv6_server_det or a newer release). "
-                             "Downloaded automatically on first start; empty = package default.")
-    parser.add_argument("--rec-model", default=None,
-                        help="text_recognition_model_name override (e.g. PP-OCRv6_server_rec). "
-                             "Downloaded automatically on first start; empty = package default.")
-    parser.add_argument("--mkldnn", action="store_true",
-                        help="enable oneDNN/MKLDNN on CPU. Default off: paddle 3.3.1 CPU + "
-                             "MKLDNN raises '(Unimplemented) ConvertPirAttribute2RuntimeAttribute "
-                             "not support' inside predict.")
-    parser.add_argument("--no-rapid", action="store_true",
-                        help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
-    parser.add_argument("--rapid-worker", default=None,
-                        help="python.exe of the RapidOCR venv for tier 2. "
-                             "Default: <service dir>/.venv-rapid (Scripts/python.exe on Windows, bin/python elsewhere). "
-                             "If the path does not exist, tier 2 is disabled with a /health note.")
-    parser.add_argument("--rapid-worker-script", default=None,
-                        help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
-    parser.add_argument("--conf-gate", type=float, default=0.70,
-                        help="tier-2 min line confidence; any line below triggers a tier-3 "
-                             "paddle CPU re-run. Default 0.70.")
-    parser.add_argument("--force-tier", choices=["auto", "gpu", "paddle-cpu", "rapidocr"], default="auto",
-                        help="test/ops override of the engine chain. rapidocr skips paddle init entirely.")
-    args = parser.parse_args()
+    args = ARGS
     state["requested_device"] = args.device
     state["lang"] = args.lang
     state["det_model"] = args.det_model
@@ -950,8 +976,6 @@ if __name__ == "__main__":
     state["enable_mkldnn"] = bool(args.mkldnn)
     state["force_tier"] = args.force_tier
     state["conf_gate"] = args.conf_gate
-    if not (0 < args.conf_gate <= 1):
-        raise SystemExit(f"--conf-gate must be in (0, 1], got {args.conf_gate}")
 
     service_dir = os.path.dirname(os.path.abspath(__file__))
     rapid_py = args.rapid_worker or default_rapid_python(service_dir)

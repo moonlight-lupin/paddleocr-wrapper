@@ -109,3 +109,17 @@ def test_engine_chain_labels(service, fresh_state):
     assert service.engine_chain() == ["paddle-gpu", "paddle-cpu"]
     fresh_state["rapid_worker"] = StubWorker(None)
     assert service.engine_chain() == ["paddle-gpu", "rapidocr-cpu", "paddle-cpu"]
+
+
+def test_engine_chain_reflects_active_device(service, fresh_state):
+    fresh_state.update(device="gpu:0", model=FakeModel())
+    assert service.engine_chain() == ["paddle-gpu", "paddle-cpu"]
+    fresh_state.update(device="cpu")                       # CPU boot or CUDA hidden
+    assert service.engine_chain() == ["paddle-cpu"]
+    fresh_state["rapid_worker"] = StubWorker(None)
+    assert service.engine_chain() == ["rapidocr-cpu", "paddle-cpu"]   # auto + CPU boot serves tier 2 first
+
+
+def test_engine_chain_explicit_cpu_before_init(service, fresh_state):
+    fresh_state.update(requested_device="cpu")
+    assert service.engine_chain() == ["paddle-cpu"]

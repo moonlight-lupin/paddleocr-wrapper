@@ -51,8 +51,9 @@ uv pip install --python .venv-gpu/Scripts/python.exe \
 ```
 
 The cu126 wheel bundles the CUDA runtime and cuDNN as pip dependencies
-(`nvidia-*-cu12`) — no NVIDIA toolkit install needed. Match the bundled cuDNN:
-the 3.3.1 wheel expects cuDNN 9.9, so if the resolved wheel is older:
+(`nvidia-*-cu12`) — no NVIDIA toolkit install needed. The 3.3.1 wheel targets cuDNN 9.9,
+but a resolved 9.5 also worked in testing (RTX 4070 Ti, 2026-11). Only if you hit a cuDNN
+load error at startup:
 
 ```bash
 uv pip install --python .venv-gpu/Scripts/python.exe nvidia-cudnn-cu12==9.9.0.52
@@ -72,7 +73,7 @@ uv pip install --python .venv-gpu/Scripts/python.exe -r req.txt
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | status, device, versions, `fallback_active`, `fallback_reason`, `engine_chain`, `conf_gate`, `rapid_worker` counters |
+| `GET /health` | status (`ok` / `warming` / `error`), device, versions, `fallback_active`, `fallback_reason`, `engine_chain`, `conf_gate`, `rapid_worker` counters |
 | `POST /ocr` | JSON body `{"image_b64": "...", "mime": "image/png"}` |
 | `POST /ocr/upload` | multipart file upload |
 | `GET /` | browser GUI |
@@ -114,13 +115,18 @@ Exit codes: `0` all OK, `1` at least one image failed, `2` service unreachable.
 
 ## Measured performance (RTX 4070 Ti, PP-OCRv6 medium, 2026-10)
 
+GPU is dozens of times faster than CPU. A later re-run on a shared desktop GPU with a small
+three-line image measured ~0.085 s vs ~3.4 s (about 40x); see
+[`docs/GPU_TEST_REPORT.md`](docs/GPU_TEST_REPORT.md). The table below is the original, larger-image benchmark.
+
+
 | Image | CPU | GPU | speedup | identical output |
 |---|---|---|---|---|
 | English prose, 800x300 | 5.08s | 0.06s | 83x | byte-identical |
 | Chinese prose | 3.79s | 0.04s | 89x | byte-identical |
 | Receipt-style layout | 6.44s | 0.07s | 97x | byte-identical |
 
-GPU runtime VRAM cost: ~1 GiB. Accuracy: EN prose, simplified Chinese, and
+GPU runtime VRAM cost: roughly 0.5-1 GiB. Accuracy: EN prose, simplified Chinese, and
 receipt-style layouts all read back exact, ZH confidence ~0.9999.
 
 ## Notes
