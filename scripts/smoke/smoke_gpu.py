@@ -1,4 +1,5 @@
 import base64, json, urllib.request
+# NOTE: one-off live smoke test; needs a running service and local bench_images/ + hard_images/ (not in repo).
 
 b64 = base64.b64encode(open("bench_images/receipt.png", "rb").read()).decode()
 req = urllib.request.Request("http://127.0.0.1:8651/ocr",

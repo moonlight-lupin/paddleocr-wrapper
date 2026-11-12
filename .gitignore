@@ -1,1 +1,8 @@
 __pycache__/
+*.pyc
+.pytest_cache/
+.venv*/
+*.egg-info/
+# local test fixtures / scratch for the smoke scripts
+bench_images/
+hard_images/

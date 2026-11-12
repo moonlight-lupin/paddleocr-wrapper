@@ -1,0 +1,8 @@
+# Tests need no paddle/rapidocr: they are stubbed in tests/conftest.py.
+pytest
+httpx
+fastapi
+python-multipart
+opencv-python-headless
+numpy
+pydantic

@@ -1,0 +1,6 @@
+# Service (CPU host). For a GPU host see README: install paddlepaddle-gpu from paddle's index instead of paddlepaddle.
+paddlepaddle
+paddleocr
+fastapi
+uvicorn[standard]
+python-multipart

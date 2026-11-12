@@ -4,7 +4,7 @@ Engine chain (all PP-OCRv6_medium det+rec), serialized by CHAIN_LOCK:
   1. paddle GPU  (paddlepaddle-gpu, ~0.05-0.34s/img). Runtime failures:
      per-request retry (auto-recovery when VRAM frees), then tier 2.
   2. RapidOCR cpu (onnxruntime child process in its own venv, ~1.5-2.2s/img;
-     lazy or boot-probed). Reader-thread timeouts (handshake 120s, call 100s);
+     lazy or boot-probed). Reader-thread timeouts (handshake 120s, whole call 80s);
      a hung child is killed and the request degrades. Two consecutive failed
      fast calls open the tier-2 circuit (reset: service restart).
   3. paddle CPU  (own model slot; mkldnn off, ~7-9.5s/img). Also re-runs when
@@ -37,9 +37,11 @@ import logging
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
@@ -52,7 +54,16 @@ import paddle
 import paddleocr
 from paddleocr import PaddleOCR
 
-app = FastAPI(title="paddle-ocr-service")
+@asynccontextmanager
+async def lifespan(_app):
+    startup()
+    try:
+        yield
+    finally:
+        shutdown()
+
+
+app = FastAPI(title="paddle-ocr-service", lifespan=lifespan)
 state = {
     "model": None,
     "device": "uninitialized",
@@ -136,6 +147,14 @@ def resolve_device(requested: str) -> str:
             raise SystemExit(f"GPU requested ({requested}) but this paddle build is CPU-only.")
         return requested
     raise SystemExit(f"Unknown device {requested!r} (use auto|cpu|gpu|gpu:N)")
+
+
+def default_rapid_python(service_dir: str, platform: str | None = None) -> str:
+    """Default tier-2 interpreter: <service dir>/.venv-rapid, Scripts\\python.exe on Windows, bin/python elsewhere."""
+    platform = platform or sys.platform
+    if platform.startswith("win"):
+        return os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
+    return os.path.join(service_dir, ".venv-rapid", "bin", "python")
 
 
 def get_model():
@@ -613,7 +632,7 @@ transition:background .35s cubic-bezier(.25,.46,.45,.94),border-color .35s cubic
 .statusbar{min-height:20px;color:var(--muted);font-size:13px;margin-top:10px}
 </style></head><body><div class="wrap">
 <h1>PaddleOCR service</h1>
-<div class="sub">PP-OCR det+rec · Windows PC · LAN only · interactive API docs at
+<div class="sub">PP-OCR det+rec · LAN service · interactive API docs at
 <a href="/docs">/docs</a> (Swagger) and <a href="/redoc">/redoc</a></div>
 <div class="chips" id="chips">loading…</div>
 
@@ -632,7 +651,7 @@ transition:background .35s cubic-bezier(.25,.46,.45,.94),border-color .35s cubic
 
 <div class="card"><h2>API cheatsheet</h2>
 <table>
-<tr><th>GET /health</th><td>JSON: status, device, versions, fallback_active, fallback_reason</td></tr>
+<tr><th>GET /health</th><td>JSON: status, device, versions, fallback_active, fallback_reason, engine_chain, rapid_worker</td></tr>
 <tr><th>POST /ocr</th><td>JSON body <code>{"image_b64": "...", "mime": "image/png"}</code> — same result shape, base64 in</td></tr>
 <tr><th>POST /ocr/upload</th><td>multipart field <code>image</code> — result: <code>{text, lines:[{index,text,confidence,box}], elapsed_s, device}</code>; <code>box</code> is the 4-point polygon in source-image pixels</td></tr>
 <tr><th>GET /docs</th><td>Interactive Swagger — run any endpoint from the browser</td></tr>
@@ -830,7 +849,6 @@ def init_model(dev):
     return PaddleOCR(**kwargs)
 
 
-@app.on_event("startup")
 def startup():
     # boot-time tier-2 probe runs in EVERY mode (forced included): a broken
     # rapid venv must surface here, not during the first request. A failed
@@ -887,7 +905,6 @@ def startup():
     log("all device candidates failed")
 
 
-@app.on_event("shutdown")
 def shutdown():
     w = state["rapid_worker"]
     if w is not None:
@@ -916,7 +933,7 @@ if __name__ == "__main__":
                         help="disable tier 2 (RapidOCR). Chain becomes GPU -> paddle CPU only.")
     parser.add_argument("--rapid-worker", default=None,
                         help="python.exe of the RapidOCR venv for tier 2. "
-                             "Default: <service dir>\\.venv-rapid\\Scripts\\python.exe. "
+                             "Default: <service dir>/.venv-rapid (Scripts/python.exe on Windows, bin/python elsewhere). "
                              "If the path does not exist, tier 2 is disabled with a /health note.")
     parser.add_argument("--rapid-worker-script", default=None,
                         help="rapid_worker.py path. Default: <service dir>\\rapid_worker.py")
@@ -937,7 +954,7 @@ if __name__ == "__main__":
         raise SystemExit(f"--conf-gate must be in (0, 1], got {args.conf_gate}")
 
     service_dir = os.path.dirname(os.path.abspath(__file__))
-    rapid_py = args.rapid_worker or os.path.join(service_dir, ".venv-rapid", "Scripts", "python.exe")
+    rapid_py = args.rapid_worker or default_rapid_python(service_dir)
     rapid_script = args.rapid_worker_script or os.path.join(service_dir, "rapid_worker.py")
     state["rapid_worker_py"] = rapid_py
     state["rapid_worker_script"] = rapid_script

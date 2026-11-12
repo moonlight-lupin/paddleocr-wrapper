@@ -1,4 +1,5 @@
 # Post-fix chain tests: tier2 pass, gate->tier3, health, parallel requests.
+# NOTE: one-off live smoke test; needs a running service and local bench_images/ + hard_images/ (not in repo).
 import base64, json, threading, urllib.request
 
 BASE = "http://127.0.0.1:8650"
