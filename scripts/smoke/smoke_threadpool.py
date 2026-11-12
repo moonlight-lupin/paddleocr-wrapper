@@ -1,4 +1,5 @@
 # Opus SHIP-condition smoke: threadpool handlers live — GPU tier-1 + /health responsive
+# NOTE: one-off live smoke test; needs a running service and local bench_images/ + hard_images/ (not in repo).
 # while a long tier-3 request runs.
 import base64, json, threading, time, urllib.request
 

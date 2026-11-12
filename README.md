@@ -93,8 +93,24 @@ Result shape (both endpoints):
 }
 ```
 
-`box` is the polygon in source-image pixel coordinates. Client example:
-see [`client_example.py`](client_example.py).
+`box` is the polygon in source-image pixel coordinates.
+
+## CLI (for scripts and agents)
+
+[`ocr_cli.py`](ocr_cli.py) is a stdlib-only client for a running service (no paddle needed on the
+calling machine). Point it at the service with `--host` or `PADDLE_OCR_URL`
+(default `http://127.0.0.1:8649`).
+
+```bash
+python ocr_cli.py receipt.png                  # JSON object on stdout
+python ocr_cli.py a.png b.jpg                  # JSON array, one entry per image
+python ocr_cli.py a.png --format text          # plain text only
+cat scan.png | python ocr_cli.py -             # image from stdin
+python ocr_cli.py --health                     # service status JSON
+```
+
+Results go to stdout, diagnostics to stderr. A failed image is `{"file": ..., "error": ...}`.
+Exit codes: `0` all OK, `1` at least one image failed, `2` service unreachable.
 
 ## Measured performance (RTX 4070 Ti, PP-OCRv6 medium, 2026-10)
 
@@ -121,8 +137,29 @@ receipt-style layouts all read back exact, ZH confidence ~0.9999.
   medium det+rec) + `onnxruntime` + opencv-headless, and put `rapid_worker.py`
   in the same directory. Missing either disables tier 2 with a startup log ("tier
   2 disabled"); `--no-rapid` skips it, `--force-tier` overrides the chain for
-  testing. The review record (BRIEF, per-round reviewer logs, FIXES) is in this
-  repository; LAN locations are documented as `<PC-LAN>`.
+  testing. The review record (briefs, per-round reviewer logs, FIXES) is in
+  [`docs/review-record/`](docs/review-record/); LAN locations are documented as `<PC-LAN>`.
+- On Linux/macOS the tier-2 interpreter defaults to `.venv-rapid/bin/python`
+  (`Scripts/python.exe` on Windows); override with `--rapid-worker`.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests stub paddle/rapidocr, so they run on any machine. `scripts/smoke/` holds live smoke
+scripts that need a running service and local sample images.
+
+```
+paddle_service.py   service (API, GUI, engine chain)
+rapid_worker.py     tier-2 child process (runs in .venv-rapid)
+ocr_cli.py          CLI client
+tests/              pytest suite
+scripts/smoke/      live smoke scripts
+docs/review-record/ tier-2 review history
+```
 
 ## License
 

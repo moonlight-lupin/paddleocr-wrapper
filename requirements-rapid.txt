@@ -1,0 +1,5 @@
+# Tier-2 worker venv (.venv-rapid): rapid_worker.py only. Keep separate from the GPU venv (opencv conflicts).
+rapidocr
+onnxruntime
+opencv-python-headless
+numpy
