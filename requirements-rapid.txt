@@ -1,5 +1,7 @@
 # Tier-2 worker venv (.venv-rapid): rapid_worker.py only. Keep separate from the GPU venv (opencv conflicts).
-rapidocr
-onnxruntime
+# rapidocr / onnxruntime as verified 2026-10-18. opencv-python-headless and numpy come
+# transitively: lock them on the host (README "Reproducible installs").
+rapidocr==3.10.0
+onnxruntime==1.31.0
 opencv-python-headless
 numpy

@@ -1,8 +1,9 @@
 # Tests need no paddle/rapidocr: they are stubbed in tests/conftest.py.
-pytest
-httpx
-fastapi
-python-multipart
-opencv-python-headless
-numpy
-pydantic
+pytest==9.2.0
+httpx==0.28.1
+fastapi==0.162.5
+python-multipart==0.0.32
+uvicorn==0.54.0
+pydantic==2.13.5
+numpy==2.5.3
+opencv-python-headless==5.0.0.93

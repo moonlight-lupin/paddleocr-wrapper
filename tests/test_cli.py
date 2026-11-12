@@ -35,6 +35,8 @@ def server():
             seen.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
             if seen[-1]["image_b64"] == "Ym9vbQ==":   # b"boom"
                 self._send(400, {"detail": "cannot decode image"})
+            elif seen[-1]["image_b64"] == "aHVnZQ==":   # b"huge"
+                self._send(413, {"detail": {"error": "request body exceeds the 20 MiB limit (--max-upload-mb)"}})
             else:
                 self._send(200, RESULT)
 
@@ -98,3 +100,11 @@ def test_host_from_env(server, tmp_path, capsys, monkeypatch):
     img = tmp_path / "a.png"
     img.write_bytes(b"x")
     assert ocr_cli.main([str(img)]) == 0
+
+
+def test_structured_service_error_is_unwrapped(server, tmp_path, capsys):
+    url, _ = server
+    img = tmp_path / "h.png"
+    img.write_bytes(b"huge")
+    assert ocr_cli.main([str(img), "--host", url]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "request body exceeds the 20 MiB limit (--max-upload-mb)"

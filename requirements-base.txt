@@ -1,0 +1,9 @@
+# Direct dependencies shared by CPU and GPU hosts, pinned to the versions verified
+# (GPU run 2026-11-12: paddleocr 3.7.0 / paddlex 3.7.2 / uvicorn 0.54.0; fastapi and
+# python-multipart as exercised by the test suite). Transitive deps are NOT pinned here:
+# generate a hashed lock on the target host (see README "Reproducible installs").
+paddleocr==3.7.0
+paddlex==3.7.2
+fastapi==0.162.5
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
