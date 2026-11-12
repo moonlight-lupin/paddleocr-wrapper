@@ -40,9 +40,17 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 
 ```bash
 uv venv .venv-gpu --python 3.12
-uv pip install --python .venv-gpu/Scripts/python.exe -r requirements-gpu.txt
+# Windows / CPython 3.12: hash-locked, exactly the verified set (recommended)
+uv pip install --python .venv-gpu/Scripts/python.exe --require-hashes \
+    --index-strategy unsafe-best-match -r requirements-gpu.lock
+# Other platforms: resolve from the pinned direct deps (then generate your own lock, see below)
+# uv pip install --python .venv-gpu/bin/python --index-strategy unsafe-best-match -r requirements-gpu.txt
 .venv-gpu/Scripts/python.exe paddle_service.py --port 8649 --device auto
 ```
+
+`--index-strategy unsafe-best-match` is required: Paddle's index also lists names such as `paddleocr`
+and `numpy`, and uv's default (`first-index`) then refuses to fall back to PyPI for them. Install
+into a fresh venv (see "Reproducible installs").
 
 #### Where the GPU wheel comes from
 
